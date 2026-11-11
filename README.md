@@ -4,7 +4,7 @@ Branch Watch is a configurable Git branch monitor for the Omarchy bar. It
 compares local branch commits with live refs on GitHub, GitLab, or any regular
 Git remote without fetching or changing the repositories.
 
-![Branch Watch bar widget and repository setup panel with sensitive values blurred](preview.png)
+![Branch Watch bar widget and complete repository setup panel using dummy project data](preview.png)
 
 Each repository and branch can have a short bar label. The checked-out branch
 is underlined. Hovering a branch shows its full repository, branch, remote,
@@ -111,7 +111,7 @@ Entering `D=develop` would instead try to find a real remote branch named `D`.
 
 ## Configuration
 
-![Branch Watch repository configuration with sensitive example values blurred](docs/setup.png)
+![Complete Branch Watch repository configuration using dummy project data](docs/setup.png)
 
 The panel writes a transparent JSON file:
 
