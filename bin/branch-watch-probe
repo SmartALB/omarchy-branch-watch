@@ -1,0 +1,245 @@
+#!/bin/bash
+# Read-only Git probe: local branch refs versus live remote refs. It never
+# fetches, pulls, checks out, resets, or enables lazy object fetching.
+set -uo pipefail
+umask 077
+
+export GIT_TERMINAL_PROMPT=0 GIT_NO_LAZY_FETCH=1 GIT_OPTIONAL_LOCKS=0 GIT_NO_REPLACE_OBJECTS=1
+export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes -o ConnectTimeout=10}"
+
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/branch-watch.json"
+STATE_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/branch-watch-state.json"
+NOTIFY_SEND="${BRANCH_WATCH_NOTIFY_SEND:-notify-send}"
+PROBE_TIMEOUT="${BRANCH_WATCH_TIMEOUT:-20}"
+[[ "$PROBE_TIMEOUT" =~ ^[1-9][0-9]?$ ]] && (( PROBE_TIMEOUT <= 30 )) || PROBE_TIMEOUT=20
+saw_json=false
+
+usage() {
+  echo 'Usage: omarchy-branch-watch-check --json [--config <file>]' >&2
+  exit 1
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --json) saw_json=true; shift ;;
+    --config)
+      [ "$#" -ge 2 ] || usage
+      case "$2" in --*) usage ;; esac
+      CONFIG_FILE="$2"; shift 2 ;;
+    *) usage ;;
+  esac
+done
+[ "$saw_json" = true ] || usage
+
+for tool in git jq timeout; do
+  command -v "$tool" >/dev/null || { echo "Missing required program: $tool" >&2; exit 3; }
+done
+
+git_read() {
+  timeout -k 2 "$PROBE_TIMEOUT" git \
+    -c protocol.allow=never \
+    -c protocol.file.allow=always \
+    -c protocol.ssh.allow=always \
+    -c protocol.http.allow=always \
+    -c protocol.https.allow=always \
+    -c protocol.git.allow=always \
+    -c protocol.ext.allow=never \
+    "$@"
+}
+
+default_config='{"schemaVersion":1,"intervalMinutes":10,"notifications":true,"repositories":[]}'
+if [ ! -r "$CONFIG_FILE" ]; then
+  config="$default_config"
+elif [ "$(stat -c %s "$CONFIG_FILE" 2>/dev/null || echo 9999999)" -gt 1048576 ]; then
+  echo 'Configuration exceeds 1 MiB' >&2; exit 3
+else
+  config="$(jq -ce '
+    select(type=="object" and (.repositories|type)=="array" and (.repositories|length)<=24)
+    | .schemaVersion = 1
+    | .intervalMinutes = ((.intervalMinutes // 10) | tonumber? // 10 | floor | if . < 1 then 1 elif . > 1440 then 1440 else . end)
+    | .notifications = (.notifications != false)
+    | .repositories |= map(select(type=="object"))
+  ' "$CONFIG_FILE" 2>/dev/null)" || { echo 'Invalid Branch Watch configuration' >&2; exit 3; }
+fi
+
+expand_home() {
+  case "$1" in
+    '~') printf '%s\n' "$HOME" ;;
+    '~/'*) printf '%s/%s\n' "$HOME" "${1#\~/}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+valid_sha() { [[ "$1" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; }
+
+emit_row() {
+  jq -nc \
+    --arg id "$repo_id" --arg name "$repo_name" --arg label "$repo_label" \
+    --arg path "${dir:-}" --arg remote "$remote" --arg branch "$branch" \
+    --arg branchLabel "$branch_label" --arg checkout "${checkout:-}" \
+    --arg state "$state" --arg local "${local_sha:-}" --arg remoteSha "${remote_sha:-}" \
+    --arg message "$message" --arg checkedAt "$checked_at" \
+    --argjson notifications "$repo_notifications" \
+    '{repoId:$id,repoName:$name,repoLabel:$label,path:$path,remoteName:$remote,
+      branch:$branch,branchLabel:$branchLabel,checkout:$checkout,
+      checkedOut:($checkout==$branch),state:$state,local:$local,remote:$remoteSha,
+      message:$message,notifications:$notifications,checkedAt:$checkedAt}'
+}
+
+repo_count="$(jq -r '.repositories | length' <<<"$config")"
+checked_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+rows=""
+
+for ((repo_index=0; repo_index<repo_count; repo_index++)); do
+  record="$(jq -c ".repositories[$repo_index]" <<<"$config")"
+  repo_id="$(jq -r --arg fallback "repo-$repo_index" '.id // $fallback | tostring | .[0:128]' <<<"$record")"
+  repo_name="$(jq -r --arg fallback "Repository $((repo_index + 1))" '.name // $fallback | tostring | .[0:128]' <<<"$record")"
+  repo_label="$(jq -r '.label // .name // "GIT" | tostring | .[0:12]' <<<"$record")"
+  configured_path="$(jq -r '.path // "" | tostring | .[0:4096]' <<<"$record")"
+  dir="$(expand_home "$configured_path")"
+  remote="$(jq -r '.remote // "origin" | tostring | if length==0 then "origin" else . end | .[0:512]' <<<"$record")"
+  repo_notifications="$(jq -r 'if .notifications == false then false else true end' <<<"$record")"
+  checkout=""; refs=""; remote_rc=0; shallow=unknown; auto_branch=false
+
+  branches="$(jq -c '
+    (.branches // [])
+    | if type!="array" then [] else . end
+    | map(if type=="string" then {name:.,label:(.[0:1]|ascii_upcase)}
+          elif type=="object" then . else empty end)
+    | map(select((.name // "" | type)=="string" and (.name|length)>0)
+          | {name:(.name[0:256]),label:((.label // .name[0:1])|tostring|.[0:12])})
+    | reduce .[] as $branch ([]; if any(.[]; .name==$branch.name) then . else .+[$branch] end)
+    | .[0:16]
+  ' <<<"$record")"
+
+  if [ -z "$dir" ] || [ ! -e "$dir/.git" ] \
+      || [ "$(git_read -C "$dir" rev-parse --is-inside-work-tree 2>/dev/null)" != true ]; then
+    if [ "$(jq length <<<"$branches")" -eq 0 ]; then branches='[{"name":"default","label":"D"}]'; fi
+    while IFS= read -r branch_record; do
+      branch="$(jq -r .name <<<"$branch_record")"; branch_label="$(jq -r .label <<<"$branch_record")"
+      state=error; message='Repository not found'; local_sha=""; remote_sha=""
+      rows+="$(emit_row)"$'\n'
+    done < <(jq -c '.[]' <<<"$branches")
+    continue
+  fi
+
+  if checkout="$(git_read -C "$dir" symbolic-ref --quiet HEAD 2>/dev/null)"; then
+    checkout="${checkout#refs/heads/}"
+  else
+    checkout="(detached HEAD)"
+  fi
+  shallow="$(git_read -C "$dir" rev-parse --is-shallow-repository 2>/dev/null)" || shallow=unknown
+
+  # An empty branch list means “watch the remote's default branch”. --symref
+  # obtains its actual name (main, master, trunk, …) without assuming one.
+  if [ "$(jq length <<<"$branches")" -eq 0 ]; then
+    auto_branch=true
+    refs="$(git_read -C "$dir" ls-remote --symref -- "$remote" HEAD 2>/dev/null)" || remote_rc=$?
+    default_branch="$(awk '$1=="ref:" && $3=="HEAD" {sub("refs/heads/", "", $2); print $2; exit}' <<<"$refs")"
+    [ -n "$default_branch" ] || default_branch="default"
+    branch_label="$(printf '%s' "$default_branch" | cut -c1 | tr '[:lower:]' '[:upper:]')"
+    branches="$(jq -nc --arg name "$default_branch" --arg label "$branch_label" '[{name:$name,label:$label}]')"
+  else
+    mapfile -t patterns < <(jq -r '.[] | .name' <<<"$branches" | while IFS= read -r candidate; do
+      if git_read check-ref-format "refs/heads/$candidate" >/dev/null 2>&1; then
+        printf 'refs/heads/%s\n' "$candidate"
+      fi
+    done)
+    if [ "${#patterns[@]}" -gt 0 ]; then
+      refs="$(git_read -C "$dir" ls-remote --refs -- "$remote" "${patterns[@]}" 2>/dev/null)" || remote_rc=$?
+    fi
+  fi
+
+  while IFS= read -r branch_record; do
+    branch="$(jq -r .name <<<"$branch_record")"; branch_label="$(jq -r .label <<<"$branch_record")"
+    if ! git_read check-ref-format "refs/heads/$branch" >/dev/null 2>&1; then
+      state=error; message='Invalid Git branch name'; local_sha=""; remote_sha=""
+      rows+="$(emit_row)"$'\n'
+      continue
+    fi
+    local_sha="$(git_read -C "$dir" rev-parse --verify "refs/heads/$branch^{commit}" 2>/dev/null)" || local_sha=""
+    if [ "$branch" = default ]; then
+      remote_sha=""
+    elif [ "$auto_branch" = true ]; then
+      remote_sha="$(awk '$2=="HEAD" && $1!="ref:" {print $1; exit}' <<<"$refs")"
+    else
+      remote_sha="$(awk -v ref="refs/heads/$branch" '$2==ref {print $1; exit}' <<<"$refs")"
+    fi
+
+    state=error; message='Remote is unreachable; check network and authentication'
+    if [ "$remote_rc" -eq 124 ] || [ "$remote_rc" -eq 137 ]; then
+      message='Remote query timed out'
+    elif [ "$remote_rc" -ne 0 ]; then :
+    elif [ "$branch" = default ]; then
+      message='Remote default branch could not be detected'
+    elif ! valid_sha "$remote_sha"; then
+      message="Branch does not exist on $remote"
+    elif [ -z "$local_sha" ]; then
+      state=missing; message='Local branch is missing; a remote ref alone is not a local test state'
+    elif [ "$local_sha" = "$remote_sha" ]; then
+      state=current; message='Up to date'
+    elif [ "$shallow" != false ]; then
+      state=different; message='Different commit; history is unavailable in this shallow clone'
+    elif ! git_read -C "$dir" cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
+      state=different; message='Different remote commit; history is unknown without fetching'
+    else
+      git_read -C "$dir" merge-base --is-ancestor "$local_sha" "$remote_sha" 2>/dev/null; lr=$?
+      git_read -C "$dir" merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; rl=$?
+      if [ "$lr" -gt 1 ] || [ "$rl" -gt 1 ]; then
+        state=different; message='Different commit; history could not be compared completely'
+      elif [ "$lr" -eq 0 ]; then state=behind; message='New remote commits are missing locally'
+      elif [ "$rl" -eq 0 ]; then state=ahead; message='Local branch is ahead'
+      else state=diverged; message='Local and remote branches have diverged'; fi
+    fi
+    rows+="$(emit_row)"$'\n'
+  done < <(jq -c '.[]' <<<"$branches")
+done
+
+result="$(jq -sc --arg checkedAt "$checked_at" --arg configPath "$CONFIG_FILE" \
+  --argjson config "$config" '
+  {schemaVersion:1,rows:.,checkedAt:$checkedAt,configPath:$configPath,
+   intervalMinutes:$config.intervalMinutes,notifications:$config.notifications}
+  | .behind=([.rows[]|select(.state=="behind")]|length)
+  | .errors=([.rows[]|select(.state=="error")]|length)
+  | .state=(if (.rows|length)==0 then "empty" elif .errors>0 then "error"
+      elif .behind>0 then "behind"
+      elif any(.rows[]; .state=="different" or .state=="diverged" or .state=="ahead") then "different"
+      elif any(.rows[]; .state=="missing") then "missing" else "current" end)
+  ' <<<"$rows")" || exit 3
+
+notify_changes() {
+  local previous='{}' next changed tmp
+  [ "$(jq -r '.notifications' <<<"$result")" = true ] || return 0
+  mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null || return 0
+  chmod 700 "$(dirname "$STATE_FILE")" 2>/dev/null || return 0
+  [ ! -L "$STATE_FILE" ] && [ ! -L "$STATE_FILE.lock" ] || return 0
+  command -v flock >/dev/null || return 0
+  exec 9>"$STATE_FILE.lock" || return 0
+  flock -w 2 9 || return 0
+  if [ -r "$STATE_FILE" ] && [ "$(stat -c %s "$STATE_FILE" 2>/dev/null || echo 999999)" -le 262144 ]; then
+    previous="$(jq -sc 'if length==1 and .[0].schemaVersion==1 and (.[0].notifications|type)=="object" then .[0].notifications else {} end' "$STATE_FILE" 2>/dev/null)" || previous='{}'
+  fi
+  changed="$(jq -r --argjson prev "$previous" 'def plain:
+      gsub("&";"&amp;") | gsub("<";"&lt;") | gsub(">";"&gt;");
+    [.rows[]
+    | select(.notifications)
+    | select(.state=="behind" or .state=="different" or .state=="diverged")
+    | .key=(.path+"\u0000"+.remoteName+"\u0000"+.branch)
+    | select($prev[.key] != .remote)
+    | (.repoName|plain)+" / "+(.branch|plain)+": "+(.message|plain)] | join("\n")' <<<"$result")"
+  next="$(jq -c --argjson prev "$previous" 'reduce .rows[] as $r ($prev;
+    ($r.path+"\u0000"+$r.remoteName+"\u0000"+$r.branch) as $key
+    | if $r.state=="error" then .
+      elif ($r.remote|test("^([0-9a-f]{40}|[0-9a-f]{64})$")) then .[$key]=$r.remote
+      else . end)
+    | {schemaVersion:1,notifications:.}' <<<"$result")"
+  if [ -n "$changed" ] && command -v "$NOTIFY_SEND" >/dev/null; then
+    timeout -k 1 3 "$NOTIFY_SEND" --app-name='Branch Watch' --urgency=normal \
+      'Branch Watch: remote changes' "$changed" >/dev/null 2>&1 || true
+  fi
+  tmp="$(mktemp "${STATE_FILE}.XXXXXX")" || return 0
+  if printf '%s\n' "$next" >"$tmp" && mv -f "$tmp" "$STATE_FILE"; then :; else rm -f "$tmp"; fi
+}
+
+notify_changes
+printf '%s\n' "$result"

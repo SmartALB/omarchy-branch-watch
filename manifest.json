@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "smartalb.branch-watch",
+  "name": "Branch Watch",
+  "version": "0.1.0",
+  "author": "SmartALB",
+  "license": "MIT",
+  "description": "Monitor local Git branches against live remotes from the Omarchy bar without fetching",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Branch Watch",
+    "description": "Configurable live Git branch status for GitHub, GitLab, and other remotes",
+    "category": "Developer Tools",
+    "aliases": [
+      "git",
+      "repository",
+      "branches",
+      "commits"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "left"
+  }
+}

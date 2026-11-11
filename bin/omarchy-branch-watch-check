@@ -1,0 +1,5 @@
+#!/bin/bash
+# Bound the complete read-only probe, including Git helpers and notifications.
+set -uo pipefail
+DIR="$(dirname "$(readlink -f "$0")")"
+exec /usr/bin/timeout -k 2 90 /bin/bash "$DIR/branch-watch-probe" "$@"
