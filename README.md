@@ -4,12 +4,14 @@ Branch Watch is a configurable Git branch monitor for the Omarchy bar. It
 compares local branch commits with live refs on GitHub, GitLab, or any regular
 Git remote without fetching or changing the repositories.
 
-![Branch Watch bar widget and complete repository setup panel using dummy project data](preview.png)
+![Branch Watch bar widget, repository overview, and branch discovery using generic demo data](preview.png)
 
 Each repository and branch can have a short bar label. The checked-out branch
 is underlined. Hovering a branch shows its full repository, branch, remote,
 checkout, status, and check time. Left-click refreshes; right-click opens the
 configuration panel.
+
+![Compact Branch Watch bar widget with generic repository and branch labels](docs/bar.png)
 
 ## Who it is for
 
@@ -36,8 +38,11 @@ behind its live remote and can notify you when a new remote commit appears.
 - Any branch name, including `main`, `master`, `develop`, and `release/*`
 - Automatic remote default-branch detection
 - Interactive discovery and selection of local and live remote branches
+- Collapsible, filterable branch results with clear selected-state markers
 - Editable short labels and one-click removal for tracked branches
-- Repository validation, unsaved-change protection, and compact status summaries
+- Repository and remote validation before saving
+- Unsaved-change and concurrent-edit protection
+- Compact per-repository status summaries and fixed editor actions
 - Multiple repositories and branches in one compact bar widget
 - Native folder picker for selecting local repositories
 - Desktop notifications for newly observed remote changes
@@ -92,7 +97,8 @@ omarchy restart shell
 5. Keep the remote as `origin`, or enter another configured remote or URL.
 6. Select **Discover branches** to choose from local and live remote branches,
    or leave the selection empty to follow the remote default automatically.
-7. Keep notifications enabled if desired and select **Save**.
+7. Keep notifications enabled if desired and select **Save**. Existing entries
+   use **Save changes**.
 
 Example for a repository whose real branches are `develop` and `master`:
 
@@ -115,7 +121,24 @@ Entering `D=develop` would instead try to find a real remote branch named `D`.
 
 ## Configuration
 
-![Complete Branch Watch repository configuration using dummy project data](docs/setup.png)
+### Repository overview
+
+![Branch Watch repository overview with generic demo data](docs/overview.png)
+
+Each repository card shows its remote and the result of the latest check, for
+example:
+
+```text
+Backend · origin
+2 current · 2026-11-23 07:35
+```
+
+Possible summary counters are **current**, **behind**, **different**,
+**missing**, and **error**. Select a card to edit it.
+
+### Repository editor
+
+![Top of the Branch Watch repository editor using generic demo data](docs/setup.png)
 
 The panel writes a transparent JSON file:
 
@@ -175,6 +198,8 @@ the discovery list are escaped automatically.
 
 ### Discovering branches
 
+![Validated repository and compact branch discovery list with main, develop, master, and release branches](docs/discovery.png)
+
 The repository editor can query the selected working tree and remote, then
 show up to 200 available branches. Each entry indicates whether it exists
 locally, remotely, or in both places, and marks the checked-out and default
@@ -185,12 +210,22 @@ can be removed without changing the advanced field manually.
 
 Discovery runs only when **Discover branches** is selected. It performs one
 bounded `git ls-remote` query and does not fetch or change the repository. The
+same button becomes **Hide branches** while the list is open. After closing it,
+**Show branches** reopens the cached result without another remote query. The
 advanced `branch=label` field remains available for manual editing.
 
 A successful discovery also validates the local working tree and remote and
-shows the detected default branch. Repository cards summarize their latest
-current, behind, different, missing, and error counts. Unsaved editor changes
-must be explicitly discarded before the panel closes.
+shows the detected default branch. **Follow default** clears the explicit
+selection and lets Branch Watch detect that branch automatically.
+
+The editor keeps **Save changes**, **Cancel**, and **Remove** available in a
+fixed footer. Unsaved changes must be explicitly discarded before closing or
+leaving the editor. If the same repository configuration changes elsewhere
+while it is open, the stale form cannot overwrite or remove the newer entry.
+
+The screenshots use local generic demo repositories. Ordinary Git names such as
+`main`, `develop`, `master`, and `release/2.x` remain visible; only the local
+username in the configuration path is blurred.
 
 ### Choosing the local path
 

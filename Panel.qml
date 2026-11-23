@@ -1187,7 +1187,7 @@ Panel {
               }
               Text {
                 visible: form.selectedBranches().length > 0
-                text: "Tracked branches — select an entry to remove it"
+                text: "Tracked branches — edit labels or remove branches"
                 textFormat: Text.PlainText
                 width: parent.width
                 color: Util.alpha(root.fg, 0.7)
