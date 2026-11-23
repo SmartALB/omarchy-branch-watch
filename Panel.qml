@@ -27,6 +27,7 @@ Panel {
   property string probeError: ""
   property bool receivedResult: false
   property bool refreshPending: false
+  property bool folderDialogActive: false
   property int configRevision: 0
   property int activeProbeRevision: -1
   property int rowsRevision: 0
@@ -413,7 +414,7 @@ Panel {
 
         Loader {
           id: settingsLoader
-          active: root.opened
+          active: root.opened || root.folderDialogActive
           width: parent.width
           sourceComponent: Component {
             Flickable {
@@ -535,7 +536,17 @@ Panel {
             function chooseRepositoryFolder() {
               var start = expandedPath(pathField.text)
               repositoryFolderDialog.currentFolder = Util.fileUrl(start || Quickshell.env("HOME"))
-              repositoryFolderDialog.open()
+              // KeyboardPanel is a layer-shell surface and would otherwise
+              // remain above the native picker. Keep this form loaded while
+              // closing the panel, then open the dialog after focus is freed.
+              root.folderDialogActive = true
+              root.close()
+              Qt.callLater(repositoryFolderDialog.open)
+            }
+
+            function returnFromFolderDialog() {
+              root.open()
+              Qt.callLater(function() { root.folderDialogActive = false })
             }
 
             function selectedLocalPath(url) {
@@ -820,7 +831,9 @@ Panel {
                 onAccepted: {
                   var selected = form.selectedLocalPath(selectedFolder)
                   if (selected) pathField.text = selected
+                  form.returnFromFolderDialog()
                 }
+                onRejected: form.returnFromFolderDialog()
               }
               Process {
                 id: branchDiscoveryProc
