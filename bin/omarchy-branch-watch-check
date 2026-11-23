@@ -1,5 +1,6 @@
 #!/bin/bash
-# Bound the complete read-only probe, including Git helpers and notifications.
+# Bound the complete read-only probe, including four concurrent remote checks
+# and notifications. Per-command timeouts remain the primary network bound.
 set -uo pipefail
 DIR="$(dirname "$(readlink -f "$0")")"
-exec /usr/bin/timeout -k 2 90 /bin/bash "$DIR/branch-watch-probe" "$@"
+exec /usr/bin/timeout -k 2 180 /bin/bash "$DIR/branch-watch-probe" "$@"

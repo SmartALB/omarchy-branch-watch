@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Dialogs
 import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
@@ -13,7 +14,6 @@ Panel {
   ipcTarget: "smartalb.branch-watch"
   manageIpc: true
 
-  readonly property string pluginVersion: "0.1.0"
   readonly property string scriptDir: decodeURIComponent(Qt.resolvedUrl("bin").toString().replace("file://", ""))
   readonly property string configPath: (Quickshell.env("XDG_CONFIG_HOME") || Quickshell.env("HOME") + "/.config") + "/omarchy/branch-watch.json"
   readonly property string fontFam: bar ? bar.fontFamily : Style.font.family
@@ -26,6 +26,9 @@ Panel {
   property string lastCheck: ""
   property string probeError: ""
   property bool receivedResult: false
+  property bool refreshPending: false
+  property int configRevision: 0
+  property int activeProbeRevision: -1
   property int rowsRevision: 0
 
   onRowsRevisionChanged: Qt.callLater(function() { content.forceLayout() })
@@ -40,6 +43,7 @@ Panel {
     if (!isFinite(interval) || interval < 1) interval = 10
     interval = Math.min(interval, 1440)
     var repositories = []
+    var repositoryIds = ({})
     var input = Array.isArray(source.repositories) ? source.repositories : []
     for (var i = 0; i < input.length && repositories.length < 24; i++) {
       var raw = input[i]
@@ -52,15 +56,22 @@ Panel {
         if (typeof candidate === "string") candidate = { name: candidate }
         if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue
         var branchName = String(candidate.name || "").slice(0, 256)
-        if (!branchName || seen[branchName]) continue
-        seen[branchName] = true
+        var branchKey = "\u0001" + branchName
+        if (!branchName || seen[branchKey]) continue
+        seen[branchKey] = true
         branches.push({
           name: branchName,
           label: String(candidate.label || branchName.slice(0, 1).toUpperCase()).slice(0, 12)
         })
       }
+      var baseId = String(raw.id || "repo-" + i).slice(0, 128)
+      var uniqueId = baseId
+      var suffix = 2
+      while (repositoryIds["\u0001" + uniqueId])
+        uniqueId = baseId.slice(0, Math.max(1, 128 - String(suffix).length - 1)) + "-" + suffix++
+      repositoryIds["\u0001" + uniqueId] = true
       repositories.push({
-        id: String(raw.id || "repo-" + i).slice(0, 128),
+        id: uniqueId,
         name: String(raw.name || "Repository " + (i + 1)).slice(0, 128),
         label: String(raw.label || raw.name || "GIT").slice(0, 12),
         path: String(raw.path || "").slice(0, 4096),
@@ -81,9 +92,11 @@ Panel {
     try {
       var parsed = JSON.parse(String(text || ""))
       root.config = root.normalizeConfig(parsed)
+      root.configRevision++
       root.probeError = ""
     } catch (error) {
       root.config = root.defaultConfig()
+      root.configRevision++
       root.probeError = "Invalid configuration: " + error
     }
     refreshSoon.restart()
@@ -92,6 +105,7 @@ Panel {
   function saveConfig(next) {
     var normalized = root.normalizeConfig(next)
     root.config = normalized
+    root.configRevision++
     configFile.setText(JSON.stringify(normalized, null, 2) + "\n")
     refreshSoon.restart()
   }
@@ -104,7 +118,12 @@ Panel {
   }
 
   function refresh() {
-    if (checkProc.running) return
+    if (checkProc.running) {
+      root.refreshPending = true
+      return
+    }
+    root.refreshPending = false
+    root.activeProbeRevision = root.configRevision
     root.receivedResult = false
     checkProc.running = true
   }
@@ -157,12 +176,13 @@ Panel {
     var list = []
     for (var i = 0; i < root.rows.length; i++) {
       var row = root.rows[i]
-      var id = String(row.repoId || "repo-" + i)
-      if (!byId[id]) {
-        byId[id] = { id: id, name: row.repoName, label: row.repoLabel, branches: [] }
-        list.push(byId[id])
+      var id = String(row.repoKey || row.repoId || "repo-" + i)
+      var groupKey = "\u0001" + id
+      if (!byId[groupKey]) {
+        byId[groupKey] = { id: id, name: row.repoName, label: row.repoLabel, branches: [] }
+        list.push(byId[groupKey])
       }
-      byId[id].branches.push(row)
+      byId[groupKey].branches.push(row)
     }
     return list
   }
@@ -176,6 +196,7 @@ Panel {
     onLoaded: root.loadConfig(text())
     onLoadFailed: {
       root.config = root.defaultConfig()
+      root.configRevision++
       refreshSoon.restart()
     }
     onFileChanged: reload()
@@ -194,20 +215,29 @@ Panel {
           for (var i = 0; i < data.rows.length; i++) {
             if (allowed.indexOf(String(data.rows[i].state)) === -1) throw new Error("Invalid branch state")
           }
+          root.receivedResult = true
+          if (root.activeProbeRevision !== root.configRevision) {
+            root.refreshPending = true
+            return
+          }
           root.rows = data.rows
           root.rowsRevision++
           root.lastCheck = Qt.formatDateTime(new Date(data.checkedAt), "yyyy-MM-dd HH:mm")
           root.probeError = ""
-          root.receivedResult = true
         } catch (error) {
-          root.probeError = "No valid response from the Branch Watch helper"
+          if (root.activeProbeRevision === root.configRevision)
+            root.probeError = "No valid response from the Branch Watch helper"
         }
       }
     }
     onExited: function(exitCode, exitStatus) {
-      if (exitCode !== 0) root.probeError = (exitCode === 124 || exitCode === 137)
-        ? "Branch Watch timed out" : "Branch Watch helper exited with error " + exitCode
-      else if (!root.receivedResult && !root.probeError) root.probeError = "Branch Watch helper returned no result"
+      if (root.activeProbeRevision === root.configRevision) {
+        if (exitCode !== 0) root.probeError = (exitCode === 124 || exitCode === 137)
+          ? "Branch Watch timed out" : "Branch Watch helper exited with error " + exitCode
+        else if (!root.receivedResult && !root.probeError) root.probeError = "Branch Watch helper returned no result"
+      }
+      if (root.refreshPending || root.activeProbeRevision !== root.configRevision)
+        Qt.callLater(root.refresh)
     }
   }
 
@@ -342,13 +372,6 @@ Panel {
                   color: chip.branchColor
                   opacity: checkProc.running ? 0.45 : 1
                   Behavior on opacity { NumberAnimation { duration: Style.duration(150) } }
-                  SequentialAnimation on scale {
-                    running: chip.branchStatus === "behind" && !checkProc.running
-                    loops: Animation.Infinite
-                    NumberAnimation { from: 1; to: 1.28; duration: Style.duration(850); easing.type: Easing.InOutSine }
-                    NumberAnimation { from: 1.28; to: 1; duration: Style.duration(850); easing.type: Easing.InOutSine }
-                    onRunningChanged: if (!running) statusDot.scale = 1
-                  }
                 }
                 Text {
                   textFormat: Text.PlainText
@@ -405,9 +428,13 @@ Panel {
             width: scroller.width
             spacing: Style.space(8)
             property int editIndex: -2
+            property string editId: ""
+            property bool confirmRemove: false
 
             function startAdd() {
               editIndex = -1
+              editId = ""
+              confirmRemove = false
               nameField.text = ""
               labelField.text = ""
               pathField.text = ""
@@ -420,6 +447,8 @@ Panel {
             function startEdit(index) {
               var repo = root.config.repositories[index]
               editIndex = index
+              editId = String(repo.id || "")
+              confirmRemove = false
               nameField.text = String(repo.name || "")
               labelField.text = String(repo.label || "")
               pathField.text = String(repo.path || "")
@@ -445,11 +474,39 @@ Panel {
                 var equal = token.indexOf("=")
                 var name = (equal < 0 ? token : token.slice(0, equal)).trim()
                 var label = (equal < 0 ? name.slice(0, 1).toUpperCase() : token.slice(equal + 1)).trim()
-                if (!name || seen[name]) continue
-                seen[name] = true
+                var branchKey = "\u0001" + name
+                if (!name || seen[branchKey]) continue
+                seen[branchKey] = true
                 result.push({ name: name, label: label || name.slice(0, 1).toUpperCase() })
               }
               return result
+            }
+
+            function expandedPath(path) {
+              var value = String(path || "").trim()
+              if (value === "~") return Quickshell.env("HOME")
+              if (value.indexOf("~/") === 0) return Quickshell.env("HOME") + value.slice(1)
+              return value
+            }
+
+            function chooseRepositoryFolder() {
+              var start = expandedPath(pathField.text)
+              repositoryFolderDialog.currentFolder = Util.fileUrl(start || Quickshell.env("HOME"))
+              repositoryFolderDialog.open()
+            }
+
+            function selectedLocalPath(url) {
+              var value = String(url || "")
+              if (value.indexOf("file://") !== 0) return ""
+              return decodeURIComponent(value.slice(7))
+            }
+
+            function currentEditIndex() {
+              if (!editId) return editIndex
+              for (var i = 0; i < root.config.repositories.length; i++) {
+                if (String(root.config.repositories[i].id || "") === editId) return i
+              }
+              return -1
             }
 
             function commitEdit() {
@@ -464,7 +521,12 @@ Panel {
                 return
               }
               var next = JSON.parse(JSON.stringify(root.config))
-              var existing = editIndex >= 0 ? next.repositories[editIndex] : null
+              var targetIndex = currentEditIndex()
+              if (editIndex >= 0 && targetIndex < 0) {
+                editorError.text = "This repository was changed or removed elsewhere. Reopen it and try again."
+                return
+              }
+              var existing = targetIndex >= 0 ? next.repositories[targetIndex] : null
               var record = {
                 id: existing && existing.id ? existing.id : "repo-" + Date.now(),
                 name: name,
@@ -474,18 +536,33 @@ Panel {
                 notifications: repoNotifications.checked,
                 branches: parsedBranches(branchesField.text)
               }
-              if (editIndex >= 0) next.repositories[editIndex] = record
+              if (targetIndex >= 0) next.repositories[targetIndex] = record
               else next.repositories.push(record)
               root.saveConfig(next)
               editIndex = -2
+              editId = ""
+              confirmRemove = false
             }
 
             function removeEdit() {
               if (editIndex < 0) { editIndex = -2; return }
+              if (!confirmRemove) {
+                confirmRemove = true
+                editorError.text = "Select “Confirm remove” to remove this repository."
+                return
+              }
               var next = JSON.parse(JSON.stringify(root.config))
-              next.repositories.splice(editIndex, 1)
+              var targetIndex = currentEditIndex()
+              if (targetIndex < 0) {
+                editorError.text = "This repository was already changed or removed elsewhere."
+                confirmRemove = false
+                return
+              }
+              next.repositories.splice(targetIndex, 1)
               root.saveConfig(next)
               editIndex = -2
+              editId = ""
+              confirmRemove = false
             }
 
             PanelSectionHeader {
@@ -537,61 +614,33 @@ Panel {
 
             Repeater {
               model: root.config.repositories
-              Rectangle {
+              Button {
                 required property var modelData
                 required property int index
                 width: form.width
                 height: Style.space(46)
-                radius: Style.cornerRadius
-                color: repoMouse.containsMouse ? Util.alpha(root.fg, 0.10) : Util.alpha(root.fg, 0.05)
-                border.width: 1
-                border.color: Util.alpha(root.fg, 0.10)
-                Text {
-                  anchors.left: parent.left
-                  anchors.leftMargin: Style.space(12)
-                  anchors.verticalCenter: parent.verticalCenter
-                  width: parent.width - Style.space(24)
-                  textFormat: Text.PlainText
-                  text: String(parent.modelData.name || "Repository") + "  ·  " + String(parent.modelData.remote || "origin")
-                  elide: Text.ElideMiddle
-                  color: root.fg
-                  font.family: root.fontFam
-                  font.pixelSize: Style.font.body
-                }
-                MouseArea {
-                  id: repoMouse
-                  anchors.fill: parent
-                  hoverEnabled: true
-                  cursorShape: Qt.PointingHandCursor
-                  onClicked: form.startEdit(parent.index)
-                }
+                text: String(modelData.name || "Repository") + "  ·  " + String(modelData.remote || "origin")
+                foreground: root.fg
+                accent: Color.accent
+                fontFamily: root.fontFam
+                leftAlign: true
+                bordered: true
+                focusable: true
+                onClicked: form.startEdit(index)
               }
             }
 
-            Rectangle {
+            Button {
               visible: root.config.repositories.length < 24
               width: form.width
               height: Style.space(40)
-              radius: Style.cornerRadius
-              color: addMouse.containsMouse ? Util.alpha(Color.accent, 0.20) : Util.alpha(Color.accent, 0.10)
-              border.width: 1
-              border.color: Util.alpha(Color.accent, 0.35)
-              Text {
-                anchors.centerIn: parent
-                textFormat: Text.PlainText
-                text: "+ Add repository"
-                color: root.fg
-                font.family: root.fontFam
-                font.pixelSize: Style.font.body
-                font.bold: true
-              }
-              MouseArea {
-                id: addMouse
-                anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onClicked: form.startAdd()
-              }
+              text: "+ Add repository"
+              foreground: root.fg
+              accent: Color.accent
+              fontFamily: root.fontFam
+              bordered: true
+              focusable: true
+              onClicked: form.startAdd()
             }
 
             Text {
@@ -615,7 +664,37 @@ Panel {
               Text { text: "Short bar label"; textFormat: Text.PlainText; color: root.fg; font.family: root.fontFam; font.pixelSize: Style.font.caption }
               TextField { id: labelField; width: parent.width; placeholderText: "API"; foreground: root.fg; accent: Color.accent; font.family: root.fontFam }
               Text { text: "Local repository path"; textFormat: Text.PlainText; color: root.fg; font.family: root.fontFam; font.pixelSize: Style.font.caption }
-              TextField { id: pathField; width: parent.width; placeholderText: "~/projects/backend"; foreground: root.fg; accent: Color.accent; font.family: root.fontFam }
+              RowLayout {
+                width: parent.width
+                spacing: Style.space(6)
+                TextField {
+                  id: pathField
+                  Layout.fillWidth: true
+                  placeholderText: "~/projects/backend"
+                  foreground: root.fg
+                  accent: Color.accent
+                  font.family: root.fontFam
+                }
+                Button {
+                  text: "Browse…"
+                  foreground: root.fg
+                  accent: Color.accent
+                  fontFamily: root.fontFam
+                  bordered: true
+                  focusable: true
+                  onClicked: form.chooseRepositoryFolder()
+                }
+              }
+              FolderDialog {
+                id: repositoryFolderDialog
+                title: "Select Git repository"
+                currentFolder: Util.fileUrl(Quickshell.env("HOME"))
+                options: FolderDialog.ReadOnly
+                onAccepted: {
+                  var selected = form.selectedLocalPath(selectedFolder)
+                  if (selected) pathField.text = selected
+                }
+              }
               Text { text: "Git remote name or URL"; textFormat: Text.PlainText; color: root.fg; font.family: root.fontFam; font.pixelSize: Style.font.caption }
               TextField { id: remoteField; width: parent.width; placeholderText: "origin"; foreground: root.fg; accent: Color.accent; font.family: root.fontFam }
               Text { text: "Branches — branch=label, comma separated; blank detects main, master, or another default"; textFormat: Text.PlainText; width: parent.width; wrapMode: Text.WordWrap; color: root.fg; font.family: root.fontFam; font.pixelSize: Style.font.caption }
@@ -626,27 +705,22 @@ Panel {
               Row {
                 spacing: Style.space(8)
                 Repeater {
-                  model: ["Save", form.editIndex >= 0 ? "Remove" : "Cancel"]
-                  Rectangle {
+                  model: ["Save", form.editIndex >= 0 ? (form.confirmRemove ? "Confirm remove" : "Remove") : "Cancel"]
+                  Button {
                     required property string modelData
                     required property int index
                     width: Style.space(100)
                     height: Style.space(38)
-                    radius: Style.cornerRadius
-                    color: actionMouse.containsMouse ? Util.alpha(index === 0 ? Color.accent : root.fg, 0.22) : Util.alpha(index === 0 ? Color.accent : root.fg, 0.11)
-                    border.width: 1
-                    border.color: Util.alpha(index === 0 ? Color.accent : root.fg, 0.30)
-                    Text { anchors.centerIn: parent; text: parent.modelData; textFormat: Text.PlainText; color: root.fg; font.family: root.fontFam; font.pixelSize: Style.font.body }
-                    MouseArea {
-                      id: actionMouse
-                      anchors.fill: parent
-                      hoverEnabled: true
-                      cursorShape: Qt.PointingHandCursor
-                      onClicked: {
-                        editorError.text = ""
-                        if (parent.index === 0) form.commitEdit()
-                        else form.removeEdit()
-                      }
+                    text: modelData
+                    foreground: root.fg
+                    accent: Color.accent
+                    fontFamily: root.fontFam
+                    bordered: true
+                    focusable: true
+                    onClicked: {
+                      editorError.text = ""
+                      if (index === 0) form.commitEdit()
+                      else form.removeEdit()
                     }
                   }
                 }

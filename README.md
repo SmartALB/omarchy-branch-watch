@@ -36,6 +36,7 @@ behind its live remote and can notify you when a new remote commit appears.
 - Any branch name, including `main`, `master`, `develop`, and `release/*`
 - Automatic remote default-branch detection
 - Multiple repositories and branches in one compact bar widget
+- Native folder picker for selecting local repositories
 - Desktop notifications for newly observed remote changes
 - Existing SSH agents and HTTPS credential helpers; no credentials stored
 - Strictly read-only repository inspection: no fetch, pull, checkout, or reset
@@ -84,7 +85,7 @@ omarchy restart shell
 1. Right-click **GIT** in the Omarchy bar.
 2. Select **Add repository**.
 3. Enter a display name and a short bar label.
-4. Enter the path of the local Git working tree.
+4. Select the local Git working tree with **Browse…**, or enter its path.
 5. Keep the remote as `origin`, or enter another configured remote or URL.
 6. Leave **Branches** empty to detect the remote default, or list branches
    explicitly.
@@ -176,7 +177,9 @@ ensures Branch Watch contacts GitHub or GitLab rather than only comparing two
 local directories.
 
 Limits protect the long-running shell and helper process: 1 MiB configuration,
-24 repositories, and 16 branches per repository.
+24 repositories, and 16 branches per repository. Repository checks use at most
+four concurrent Git processes so one slow remote does not block every later
+repository.
 
 ## GitHub, GitLab, and authentication
 
@@ -288,10 +291,10 @@ that the probe changes no refs or objects.
 
 ```bash
 test/run-tests.sh
-
-omarchy plugin validate .
-qmllint -I /usr/share/omarchy/shell Panel.qml
 ```
+
+The test entry point runs the Git matrix, QML smoke test, plugin manifest
+validation, and `qmllint`.
 
 ## Remove
 

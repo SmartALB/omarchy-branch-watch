@@ -89,6 +89,19 @@ ShellRoot {
       if (normalized.repositories.length !== 1 || normalized.repositories[0].branches.length !== 0) {
         console.log("BRANCH_WATCH_QML_FAIL config normalization"); Qt.quit(); return
       }
+      var unique = horizontal.normalizeConfig({repositories: [{id: "same"}, {id: "same"}]})
+      if (unique.repositories[0].id === unique.repositories[1].id) {
+        console.log("BRANCH_WATCH_QML_FAIL duplicate repository ids"); Qt.quit(); return
+      }
+      var originalRows = horizontal.rows
+      horizontal.rows = [
+        {repoId: "__proto__", repoKey: "0:__proto__", branch: "main"},
+        {repoId: "__proto__", repoKey: "1:__proto__", branch: "main"}
+      ]
+      if (horizontal.groups().length !== 2) {
+        console.log("BRANCH_WATCH_QML_FAIL safe repository grouping"); Qt.quit(); return
+      }
+      horizontal.rows = originalRows
       horizontal.probeError = "Branch Watch timed out"
       var stale = horizontal.tooltip(horizontal.rows[0])
       if (stale.indexOf("Last known status:") === -1 || stale.indexOf("Data may be stale") === -1) {

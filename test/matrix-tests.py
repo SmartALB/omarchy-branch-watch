@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -217,6 +218,46 @@ class RepoWatchTests(unittest.TestCase):
         self.result()
         self.assertEqual(self.notified(), [])
 
+    def test_changes_while_notifications_are_disabled_do_not_arrive_late(self):
+        _, _, clone = self.make_repo("backend", "main")
+        repository = {"name": "Backend", "path": str(clone),
+                      "remote": "origin", "branches": ["main"]}
+        self.write_config([repository], notifications=False)
+        self.advance("backend", "main")
+        self.result()
+        self.write_config([repository], notifications=True)
+        self.result()
+        self.assertEqual(self.notified(), [])
+
+    def test_failed_notification_is_retried(self):
+        _, _, clone = self.make_repo("backend", "main")
+        self.write_config([{"name": "Backend", "path": str(clone),
+                            "remote": "origin", "branches": ["main"]}])
+        self.advance("backend", "main")
+        working_notify = self.env["BRANCH_WATCH_NOTIFY_SEND"]
+        self.env["BRANCH_WATCH_NOTIFY_SEND"] = "/usr/bin/false"
+        self.result()
+        self.assertEqual(self.notified(), [])
+        self.env["BRANCH_WATCH_NOTIFY_SEND"] = working_notify
+        self.result()
+        self.assertEqual(len(self.notified()), 1)
+
+    def test_disabled_duplicate_does_not_suppress_notification_retry(self):
+        _, _, clone = self.make_repo("backend", "main")
+        repository = {"name": "Backend", "path": str(clone),
+                      "remote": "origin", "branches": ["main"]}
+        self.write_config([
+            {**repository, "id": "enabled", "notifications": True},
+            {**repository, "id": "disabled", "notifications": False},
+        ])
+        self.advance("backend", "main")
+        working_notify = self.env["BRANCH_WATCH_NOTIFY_SEND"]
+        self.env["BRANCH_WATCH_NOTIFY_SEND"] = "/usr/bin/false"
+        self.result()
+        self.env["BRANCH_WATCH_NOTIFY_SEND"] = working_notify
+        self.result()
+        self.assertEqual(len(self.notified()), 1)
+
     def test_repository_notifications_can_be_disabled(self):
         _, _, clone = self.make_repo("backend", "main")
         self.write_config([{"name": "Backend", "path": str(clone), "remote": "origin",
@@ -240,6 +281,72 @@ class RepoWatchTests(unittest.TestCase):
         self.assertNotEqual(self.probe().returncode, 0)
         self.config.write_bytes(b" " * (1024 * 1024 + 1))
         self.assertNotEqual(self.probe().returncode, 0)
+
+    def test_slow_remotes_are_checked_with_bounded_parallelism(self):
+        _, _, clone = self.make_repo("backend", "main")
+        fake_bin = self.box / "bin"
+        fake_bin.mkdir()
+        fake_git = fake_bin / "git"
+        fake_git.write_text(
+            '#!/bin/bash\n'
+            'if [[ " $* " == *" ls-remote "* && "$*" == *"slow-"* ]]; then\n'
+            '  sleep 1\n'
+            '  exit 1\n'
+            'fi\n'
+            'exec /usr/bin/git "$@"\n'
+        )
+        fake_git.chmod(0o755)
+        self.env["PATH"] = f"{fake_bin}:/usr/bin:/bin"
+        self.write_config([
+            {"id": f"slow-{index}", "name": f"Slow {index}", "path": str(clone),
+             "remote": f"slow-{index}", "branches": ["main"]}
+            for index in range(8)
+        ])
+        started = time.monotonic()
+        data = self.result()
+        elapsed = time.monotonic() - started
+        self.assertEqual(len(data["rows"]), 8)
+        self.assertTrue(all(row["state"] == "error" for row in data["rows"]))
+        self.assertLess(elapsed, 5)
+
+    def test_repository_ssh_command_is_preserved_and_made_noninteractive(self):
+        _, _, clone = self.make_repo("backend", "main")
+        self.git(clone, "config", "core.sshCommand", "ssh -i /tmp/branch-watch-test-key")
+        fake_bin = self.box / "ssh-bin"
+        fake_bin.mkdir()
+        ssh_log = self.box / "ssh-command"
+        fake_git = fake_bin / "git"
+        fake_git.write_text(
+            '#!/bin/bash\n'
+            'if [[ " $* " == *" ls-remote "* && "$*" == *"inspect-ssh"* ]]; then\n'
+            '  printf "%s" "$GIT_SSH_COMMAND" >"$SSH_LOG"\n'
+            '  exit 1\n'
+            'fi\n'
+            'exec /usr/bin/git "$@"\n'
+        )
+        fake_git.chmod(0o755)
+        self.env["PATH"] = f"{fake_bin}:/usr/bin:/bin"
+        self.env["SSH_LOG"] = str(ssh_log)
+        self.env.pop("GIT_SSH_COMMAND")
+        self.write_config([{"name": "Backend", "path": str(clone),
+                            "remote": "inspect-ssh", "branches": ["main"]}])
+        self.result()
+        command = ssh_log.read_text()
+        self.assertIn("ssh -i /tmp/branch-watch-test-key", command)
+        self.assertIn("-o BatchMode=yes", command)
+        self.assertIn("-o ConnectTimeout=10", command)
+
+    def test_duplicate_repository_ids_get_distinct_result_keys(self):
+        _, _, clone = self.make_repo("backend", "main")
+        self.write_config([
+            {"id": "same", "name": "First", "path": str(clone),
+             "remote": "origin", "branches": ["main"]},
+            {"id": "same", "name": "Second", "path": str(clone),
+             "remote": "origin", "branches": ["main"]},
+        ])
+        rows = self.result()["rows"]
+        self.assertEqual([row["repoId"] for row in rows], ["same", "same"])
+        self.assertEqual(len({row["repoKey"] for row in rows}), 2)
 
 
 if __name__ == "__main__":
