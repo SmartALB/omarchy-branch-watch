@@ -593,12 +593,27 @@ Panel {
               return false
             }
 
-            function toggleBranch(name) {
+            function selectedBranches() {
+              return parsedBranches(branchesField.text)
+            }
+
+            function removeBranch(name) {
               var selected = parsedBranches(branchesField.text)
               for (var i = 0; i < selected.length; i++) {
                 if (selected[i].name === name) {
                   selected.splice(i, 1)
                   branchesField.text = formatBranches(selected)
+                  branchDiscoveryError = ""
+                  return
+                }
+              }
+            }
+
+            function toggleBranch(name) {
+              var selected = parsedBranches(branchesField.text)
+              for (var i = 0; i < selected.length; i++) {
+                if (selected[i].name === name) {
+                  removeBranch(name)
                   return
                 }
               }
@@ -642,7 +657,8 @@ Panel {
               var details = []
               if (branch.default) details.push("Default")
               if (branch.checkedOut) details.push("Checked out")
-              return String(branch.name || "") + "  ·  " + location
+              return (branchIsSelected(String(branch.name || "")) ? "✓  " : "○  ")
+                + String(branch.name || "") + "  ·  " + location
                 + (details.length ? "  ·  " + details.join(", ") : "")
             }
 
@@ -898,6 +914,33 @@ Panel {
                 color: root.fg
                 font.family: root.fontFam
                 font.pixelSize: Style.font.caption
+              }
+              Text {
+                visible: form.selectedBranches().length > 0
+                text: "Tracked branches — select an entry to remove it"
+                textFormat: Text.PlainText
+                width: parent.width
+                color: Util.alpha(root.fg, 0.7)
+                font.family: root.fontFam
+                font.pixelSize: Style.font.caption
+              }
+              Repeater {
+                model: form.selectedBranches()
+                Button {
+                  required property var modelData
+                  width: form.width
+                  text: "×  " + String(modelData.name || "")
+                    + "  ·  Label: " + String(modelData.label || "")
+                  tooltipText: "Remove " + String(modelData.name || "") + " from tracked branches"
+                  foreground: root.fg
+                  accent: Color.accent
+                  fontFamily: root.fontFam
+                  leftAlign: true
+                  bordered: true
+                  focusable: true
+                  selected: true
+                  onClicked: form.removeBranch(String(modelData.name || ""))
+                }
               }
               RowLayout {
                 width: parent.width
