@@ -435,6 +435,7 @@ Panel {
             property bool branchDiscoveryLoading: false
             property bool branchDiscoveryReceived: false
             property bool branchDiscoveryTruncated: false
+            property bool branchListExpanded: false
             property string branchDiscoveryError: ""
             property string activeDiscoveryKey: ""
 
@@ -449,6 +450,7 @@ Panel {
               branchesField.text = ""
               discoveredBranches = []
               branchDiscoveryTruncated = false
+              branchListExpanded = false
               branchDiscoveryError = ""
               branchFilter.text = ""
               repoNotifications.checked = true
@@ -474,6 +476,7 @@ Panel {
               branchesField.text = formatBranches(parts)
               discoveredBranches = []
               branchDiscoveryTruncated = false
+              branchListExpanded = false
               branchDiscoveryError = ""
               branchFilter.text = ""
               repoNotifications.checked = repo.notifications !== false
@@ -560,6 +563,14 @@ Panel {
             }
 
             function discoverBranches() {
+              if (branchListExpanded) {
+                branchListExpanded = false
+                return
+              }
+              if (discoveredBranches.length > 0 && activeDiscoveryKey === discoveryKey()) {
+                branchListExpanded = true
+                return
+              }
               if (!pathField.text.trim()) {
                 branchDiscoveryError = "Select or enter a local repository first."
                 return
@@ -568,6 +579,7 @@ Panel {
               branchDiscoveryError = ""
               discoveredBranches = []
               branchDiscoveryTruncated = false
+              branchListExpanded = false
               branchDiscoveryReceived = false
               branchDiscoveryLoading = true
               activeDiscoveryKey = discoveryKey()
@@ -858,6 +870,7 @@ Panel {
                       form.discoveredBranches = data.branches
                       form.branchDiscoveryTruncated = data.truncated === true
                       form.branchDiscoveryError = String(data.error || "")
+                      form.branchListExpanded = !form.branchDiscoveryError && data.branches.length > 0
                       if (!form.branchDiscoveryError && data.branches.length === 0)
                         form.branchDiscoveryError = "No local or remote branches were found."
                     } catch (error) {
@@ -891,7 +904,11 @@ Panel {
                 spacing: Style.space(6)
                 Button {
                   Layout.fillWidth: true
-                  text: form.branchDiscoveryLoading ? "Discovering branches…" : "Discover branches"
+                  text: form.branchDiscoveryLoading ? "Discovering branches…"
+                    : form.branchListExpanded ? "Hide branches"
+                    : form.discoveredBranches.length > 0
+                      && form.activeDiscoveryKey === form.discoveryKey() ? "Show branches"
+                    : "Discover branches"
                   foreground: root.fg
                   accent: Color.accent
                   fontFamily: root.fontFam
@@ -910,13 +927,14 @@ Panel {
                   selected: branchesField.text.trim() === ""
                   onClicked: {
                     branchesField.text = ""
+                    form.branchListExpanded = false
                     form.branchDiscoveryError = ""
                   }
                 }
               }
               TextField {
                 id: branchFilter
-                visible: form.discoveredBranches.length > 8
+                visible: form.branchListExpanded && form.discoveredBranches.length > 8
                 width: parent.width
                 placeholderText: "Filter discovered branches"
                 foreground: root.fg
@@ -924,7 +942,7 @@ Panel {
                 font.family: root.fontFam
               }
               Repeater {
-                model: form.filteredDiscoveredBranches()
+                model: form.branchListExpanded ? form.filteredDiscoveredBranches() : []
                 Button {
                   required property var modelData
                   width: form.width
@@ -950,7 +968,7 @@ Panel {
                 font.pixelSize: Style.font.caption
               }
               Text {
-                visible: form.branchDiscoveryTruncated
+                visible: form.branchListExpanded && form.branchDiscoveryTruncated
                 width: parent.width
                 text: "Showing the first 200 branches. Use the advanced field for another branch."
                 textFormat: Text.PlainText
