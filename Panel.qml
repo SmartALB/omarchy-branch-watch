@@ -4,6 +4,7 @@ import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 
 // Configurable, read-only Git branch monitoring. The helper performs one live
@@ -1402,12 +1403,30 @@ Panel {
               font.pixelSize: Style.font.caption
             }
           }
+              Rectangle {
+                id: editorFooter
+                visible: editorActions.visible
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.bottom: parent.bottom
+                height: settingsBody.footerSpace
+                color: Commons.Color.popups.background
+                z: 1
+
+                Rectangle {
+                  anchors.top: parent.top
+                  width: parent.width
+                  height: Style.space(1)
+                  color: Util.alpha(root.fg, 0.12)
+                }
+              }
               Row {
                 id: editorActions
                 visible: form.editIndex >= -1
                 anchors.left: parent.left
                 anchors.bottom: parent.bottom
                 spacing: Style.space(8)
+                z: 2
 
                 Button {
                   visible: root.closeConfirmation || form.confirmCancel
