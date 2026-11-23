@@ -430,6 +430,12 @@ Panel {
             property int editIndex: -2
             property string editId: ""
             property bool confirmRemove: false
+            property var discoveredBranches: []
+            property bool branchDiscoveryLoading: false
+            property bool branchDiscoveryReceived: false
+            property bool branchDiscoveryTruncated: false
+            property string branchDiscoveryError: ""
+            property string activeDiscoveryKey: ""
 
             function startAdd() {
               editIndex = -1
@@ -440,6 +446,10 @@ Panel {
               pathField.text = ""
               remoteField.text = "origin"
               branchesField.text = ""
+              discoveredBranches = []
+              branchDiscoveryTruncated = false
+              branchDiscoveryError = ""
+              branchFilter.text = ""
               repoNotifications.checked = true
               nameField.forceActiveFocus()
             }
@@ -458,27 +468,60 @@ Panel {
               for (var i = 0; i < branches.length; i++) {
                 var branch = typeof branches[i] === "string" ? { name: branches[i] } : branches[i]
                 if (!branch || !branch.name) continue
-                parts.push(String(branch.name) + (branch.label ? "=" + String(branch.label) : ""))
+                parts.push({name: String(branch.name), label: String(branch.label || "")})
               }
-              branchesField.text = parts.join(", ")
+              branchesField.text = formatBranches(parts)
+              discoveredBranches = []
+              branchDiscoveryTruncated = false
+              branchDiscoveryError = ""
+              branchFilter.text = ""
               repoNotifications.checked = repo.notifications !== false
             }
 
             function parsedBranches(text) {
               var result = []
               var seen = ({})
-              var parts = String(text || "").split(",")
-              for (var i = 0; i < parts.length && result.length < 16; i++) {
-                var token = parts[i].trim()
-                if (!token) continue
-                var equal = token.indexOf("=")
-                var name = (equal < 0 ? token : token.slice(0, equal)).trim()
-                var label = (equal < 0 ? name.slice(0, 1).toUpperCase() : token.slice(equal + 1)).trim()
+              var input = String(text || "")
+              var namePart = ""
+              var labelPart = ""
+              var inLabel = false
+              var escaped = false
+
+              function appendBranch() {
+                var name = namePart.trim()
+                var label = (inLabel ? labelPart : name.slice(0, 1).toUpperCase()).trim()
                 var branchKey = "\u0001" + name
-                if (!name || seen[branchKey]) continue
+                if (!name || seen[branchKey]) return
                 seen[branchKey] = true
                 result.push({ name: name, label: label || name.slice(0, 1).toUpperCase() })
               }
+
+              for (var i = 0; i < input.length; i++) {
+                var character = input.charAt(i)
+                if (escaped) {
+                  if (inLabel) labelPart += character
+                  else namePart += character
+                  escaped = false
+                } else if (character === "\\") {
+                  escaped = true
+                } else if (character === "=" && !inLabel) {
+                  inLabel = true
+                } else if (character === ",") {
+                  appendBranch()
+                  namePart = ""
+                  labelPart = ""
+                  inLabel = false
+                } else if (inLabel) {
+                  labelPart += character
+                } else {
+                  namePart += character
+                }
+              }
+              if (escaped) {
+                if (inLabel) labelPart += "\\"
+                else namePart += "\\"
+              }
+              appendBranch()
               return result
             }
 
@@ -501,6 +544,85 @@ Panel {
               return decodeURIComponent(value.slice(7))
             }
 
+            function discoveryKey() {
+              return expandedPath(pathField.text) + "\u0000" + (remoteField.text.trim() || "origin")
+            }
+
+            function discoverBranches() {
+              if (!pathField.text.trim()) {
+                branchDiscoveryError = "Select or enter a local repository first."
+                return
+              }
+              if (branchDiscoveryProc.running) return
+              branchDiscoveryError = ""
+              discoveredBranches = []
+              branchDiscoveryTruncated = false
+              branchDiscoveryReceived = false
+              branchDiscoveryLoading = true
+              activeDiscoveryKey = discoveryKey()
+              branchDiscoveryProc.running = true
+            }
+
+            function branchIsSelected(name) {
+              var selected = parsedBranches(branchesField.text)
+              for (var i = 0; i < selected.length; i++)
+                if (selected[i].name === name) return true
+              return false
+            }
+
+            function toggleBranch(name) {
+              var selected = parsedBranches(branchesField.text)
+              for (var i = 0; i < selected.length; i++) {
+                if (selected[i].name === name) {
+                  selected.splice(i, 1)
+                  branchesField.text = formatBranches(selected)
+                  return
+                }
+              }
+              if (selected.length >= 16) {
+                branchDiscoveryError = "At most 16 branches can be monitored per repository."
+                return
+              }
+              selected.push({name: name, label: name.slice(0, 1).toUpperCase()})
+              branchesField.text = formatBranches(selected)
+              branchDiscoveryError = ""
+            }
+
+            function formatBranches(branches) {
+              var parts = []
+              function escaped(value) {
+                return String(value || "").replace(/\\/g, "\\\\").replace(/,/g, "\\,").replace(/=/g, "\\=")
+              }
+              for (var i = 0; i < branches.length; i++) {
+                var branch = typeof branches[i] === "string" ? {name: branches[i]} : branches[i]
+                if (!branch || !branch.name) continue
+                parts.push(escaped(branch.name) + "="
+                  + escaped(branch.label || String(branch.name).slice(0, 1).toUpperCase()))
+              }
+              return parts.join(", ")
+            }
+
+            function filteredDiscoveredBranches() {
+              var needle = branchFilter.text.trim().toLowerCase()
+              if (!needle) return discoveredBranches
+              var filtered = []
+              for (var i = 0; i < discoveredBranches.length; i++) {
+                if (String(discoveredBranches[i].name || "").toLowerCase().indexOf(needle) !== -1)
+                  filtered.push(discoveredBranches[i])
+              }
+              return filtered
+            }
+
+            function branchDescription(branch) {
+              var location = branch.local && branch.remote ? "Local + Remote"
+                : branch.remote ? "Remote only" : "Local only"
+              var details = []
+              if (branch.default) details.push("Default")
+              if (branch.checkedOut) details.push("Checked out")
+              return String(branch.name || "") + "  ·  " + location
+                + (details.length ? "  ·  " + details.join(", ") : "")
+            }
+
             function currentEditIndex() {
               if (!editId) return editIndex
               for (var i = 0; i < root.config.repositories.length; i++) {
@@ -520,6 +642,11 @@ Panel {
                 editorError.text = "The limit of 24 repositories has been reached."
                 return
               }
+              var selectedBranches = parsedBranches(branchesField.text)
+              if (selectedBranches.length > 16) {
+                editorError.text = "At most 16 branches can be monitored per repository."
+                return
+              }
               var next = JSON.parse(JSON.stringify(root.config))
               var targetIndex = currentEditIndex()
               if (editIndex >= 0 && targetIndex < 0) {
@@ -534,7 +661,7 @@ Panel {
                 path: path,
                 remote: remoteField.text.trim() || "origin",
                 notifications: repoNotifications.checked,
-                branches: parsedBranches(branchesField.text)
+                branches: selectedBranches
               }
               if (targetIndex >= 0) next.repositories[targetIndex] = record
               else next.repositories.push(record)
@@ -695,9 +822,138 @@ Panel {
                   if (selected) pathField.text = selected
                 }
               }
+              Process {
+                id: branchDiscoveryProc
+                command: [
+                  root.scriptDir + "/branch-watch-list-branches",
+                  "--json",
+                  "--path", form.expandedPath(pathField.text),
+                  "--remote", remoteField.text.trim() || "origin"
+                ]
+                stdout: StdioCollector {
+                  waitForEnd: true
+                  onStreamFinished: {
+                    form.branchDiscoveryReceived = true
+                    if (form.activeDiscoveryKey !== form.discoveryKey()) {
+                      form.branchDiscoveryError = "Repository settings changed; discover branches again."
+                      return
+                    }
+                    try {
+                      var data = JSON.parse(String(text || ""))
+                      if (data.schemaVersion !== 1 || !Array.isArray(data.branches))
+                        throw new Error("Invalid branch response")
+                      form.discoveredBranches = data.branches
+                      form.branchDiscoveryTruncated = data.truncated === true
+                      form.branchDiscoveryError = String(data.error || "")
+                      if (!form.branchDiscoveryError && data.branches.length === 0)
+                        form.branchDiscoveryError = "No local or remote branches were found."
+                    } catch (error) {
+                      form.branchDiscoveryError = "No valid response from the branch discovery helper."
+                    }
+                  }
+                }
+                onExited: function(exitCode, exitStatus) {
+                  form.branchDiscoveryLoading = false
+                  if (exitCode !== 0 && !form.branchDiscoveryError)
+                    form.branchDiscoveryError = (exitCode === 124 || exitCode === 137)
+                      ? "Branch discovery timed out."
+                      : "Branch discovery helper exited with error " + exitCode + "."
+                  else if (!form.branchDiscoveryReceived && !form.branchDiscoveryError)
+                    form.branchDiscoveryError = "Branch discovery helper returned no result."
+                }
+              }
               Text { text: "Git remote name or URL"; textFormat: Text.PlainText; color: root.fg; font.family: root.fontFam; font.pixelSize: Style.font.caption }
               TextField { id: remoteField; width: parent.width; placeholderText: "origin"; foreground: root.fg; accent: Color.accent; font.family: root.fontFam }
-              Text { text: "Branches — branch=label, comma separated; blank detects main, master, or another default"; textFormat: Text.PlainText; width: parent.width; wrapMode: Text.WordWrap; color: root.fg; font.family: root.fontFam; font.pixelSize: Style.font.caption }
+              Text {
+                text: "Branches — leave the selection empty to follow the remote default branch automatically."
+                textFormat: Text.PlainText
+                width: parent.width
+                wrapMode: Text.WordWrap
+                color: root.fg
+                font.family: root.fontFam
+                font.pixelSize: Style.font.caption
+              }
+              RowLayout {
+                width: parent.width
+                spacing: Style.space(6)
+                Button {
+                  Layout.fillWidth: true
+                  text: form.branchDiscoveryLoading ? "Discovering branches…" : "Discover branches"
+                  foreground: root.fg
+                  accent: Color.accent
+                  fontFamily: root.fontFam
+                  bordered: true
+                  focusable: true
+                  enabled: !form.branchDiscoveryLoading
+                  onClicked: form.discoverBranches()
+                }
+                Button {
+                  text: "Follow default"
+                  foreground: root.fg
+                  accent: Color.accent
+                  fontFamily: root.fontFam
+                  bordered: true
+                  focusable: true
+                  selected: branchesField.text.trim() === ""
+                  onClicked: {
+                    branchesField.text = ""
+                    form.branchDiscoveryError = ""
+                  }
+                }
+              }
+              TextField {
+                id: branchFilter
+                visible: form.discoveredBranches.length > 8
+                width: parent.width
+                placeholderText: "Filter discovered branches"
+                foreground: root.fg
+                accent: Color.accent
+                font.family: root.fontFam
+              }
+              Repeater {
+                model: form.filteredDiscoveredBranches()
+                Button {
+                  required property var modelData
+                  width: form.width
+                  text: form.branchDescription(modelData)
+                  foreground: root.fg
+                  accent: Color.accent
+                  fontFamily: root.fontFam
+                  leftAlign: true
+                  bordered: true
+                  focusable: true
+                  selected: form.branchIsSelected(String(modelData.name || ""))
+                  onClicked: form.toggleBranch(String(modelData.name || ""))
+                }
+              }
+              Text {
+                visible: form.branchDiscoveryError !== ""
+                width: parent.width
+                text: form.branchDiscoveryError
+                textFormat: Text.PlainText
+                wrapMode: Text.WordWrap
+                color: "#ef7777"
+                font.family: root.fontFam
+                font.pixelSize: Style.font.caption
+              }
+              Text {
+                visible: form.branchDiscoveryTruncated
+                width: parent.width
+                text: "Showing the first 200 branches. Use the advanced field for another branch."
+                textFormat: Text.PlainText
+                wrapMode: Text.WordWrap
+                color: Util.alpha(root.fg, 0.7)
+                font.family: root.fontFam
+                font.pixelSize: Style.font.caption
+              }
+              Text {
+                text: "Advanced/manual selection — branch=label, comma separated"
+                textFormat: Text.PlainText
+                width: parent.width
+                color: Util.alpha(root.fg, 0.7)
+                font.family: root.fontFam
+                font.pixelSize: Style.font.caption
+              }
               TextField { id: branchesField; width: parent.width; placeholderText: "develop=D, master=M"; foreground: root.fg; accent: Color.accent; font.family: root.fontFam }
               Toggle { id: repoNotifications; width: parent.width; label: "Notifications for this repository"; foreground: root.fg; accent: Color.accent; fontFamily: root.fontFam; checked: true }
               Text { id: editorError; width: parent.width; textFormat: Text.PlainText; wrapMode: Text.WordWrap; color: "#ef7777"; font.family: root.fontFam; font.pixelSize: Style.font.caption }

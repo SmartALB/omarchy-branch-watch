@@ -14,6 +14,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 CHECK = ROOT / "bin/omarchy-branch-watch-check"
+LIST_BRANCHES = ROOT / "bin/branch-watch-list-branches"
 
 
 class RepoWatchTests(unittest.TestCase):
@@ -83,6 +84,15 @@ class RepoWatchTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 
+    def list_branches(self, repository, remote="origin"):
+        result = subprocess.run(
+            ["/bin/bash", str(LIST_BRANCHES), "--json",
+             "--path", str(repository), "--remote", remote],
+            env=self.env, capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
     def notified(self):
         return self.notify_log.read_text().splitlines() if self.notify_log.exists() else []
 
@@ -111,6 +121,63 @@ class RepoWatchTests(unittest.TestCase):
                             "remote": "origin", "branches": []}])
         row = self.result()["rows"][0]
         self.assertEqual((row["branch"], row["state"]), ("master", "current"))
+
+    def test_branch_discovery_marks_default_checkout_and_locations(self):
+        _, work, clone = self.make_repo("discover", "main")
+        self.git(work, "switch", "-c", "remote-only")
+        self.git(work, "push", "upstream", "remote-only")
+        self.git(clone, "branch", "local-only")
+        before = (self.git(clone, "show-ref"), self.git(clone, "count-objects", "-v"))
+        data = self.list_branches(clone)
+        self.assertEqual(before, (self.git(clone, "show-ref"),
+                                  self.git(clone, "count-objects", "-v")))
+        branches = {branch["name"]: branch for branch in data["branches"]}
+        self.assertEqual(data["defaultBranch"], "main")
+        self.assertTrue(branches["main"]["default"])
+        self.assertTrue(branches["main"]["checkedOut"])
+        self.assertEqual((branches["main"]["local"], branches["main"]["remote"]),
+                         (True, True))
+        self.assertEqual((branches["remote-only"]["local"],
+                          branches["remote-only"]["remote"]), (False, True))
+        self.assertEqual((branches["local-only"]["local"],
+                          branches["local-only"]["remote"]), (True, False))
+
+    def test_branch_discovery_reports_missing_repository(self):
+        data = self.list_branches(self.box / "absent")
+        self.assertEqual(data["branches"], [])
+        self.assertIn("not found", data["error"].lower())
+
+    def test_branch_discovery_reports_missing_jq_as_json(self):
+        empty_path = self.box / "empty-path"
+        empty_path.mkdir()
+        env = dict(self.env)
+        env["PATH"] = str(empty_path)
+        result = subprocess.run(
+            ["/bin/bash", str(LIST_BRANCHES), "--json",
+             "--path", str(self.box / "absent")],
+            env=env, capture_output=True, text=True, timeout=5,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("jq", json.loads(result.stdout)["error"])
+
+    def test_branch_discovery_bounds_remote_output_while_streaming(self):
+        _, _, clone = self.make_repo("backend", "main")
+        fake_bin = self.box / "large-output-bin"
+        fake_bin.mkdir()
+        fake_git = fake_bin / "git"
+        fake_git.write_text(
+            '#!/bin/bash\n'
+            'if [[ " $* " == *" ls-remote "* && "$*" == *"huge-output"* ]]; then\n'
+            '  /usr/bin/head -c 300000 /dev/zero\n'
+            '  exit 0\n'
+            'fi\n'
+            'exec /usr/bin/git "$@"\n'
+        )
+        fake_git.chmod(0o755)
+        self.env["PATH"] = f"{fake_bin}:/usr/bin:/bin"
+        data = self.list_branches(clone, "huge-output")
+        self.assertEqual(data["branches"], [])
+        self.assertIn("256 KiB", data["error"])
 
     def test_non_array_branches_use_default_detection(self):
         _, _, clone = self.make_repo("legacy", "master")

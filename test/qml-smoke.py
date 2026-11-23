@@ -102,6 +102,12 @@ ShellRoot {
         console.log("BRANCH_WATCH_QML_FAIL safe repository grouping"); Qt.quit(); return
       }
       horizontal.rows = originalRows
+      var specialBranches = horizontal.normalizeConfig({repositories: [{
+        branches: [{name: "release,one=stable", label: "R,="}]
+      }]})
+      if (specialBranches.repositories[0].branches[0].name !== "release,one=stable") {
+        console.log("BRANCH_WATCH_QML_FAIL special branch normalization"); Qt.quit(); return
+      }
       horizontal.probeError = "Branch Watch timed out"
       var stale = horizontal.tooltip(horizontal.rows[0])
       if (stale.indexOf("Last known status:") === -1 || stale.indexOf("Data may be stale") === -1) {

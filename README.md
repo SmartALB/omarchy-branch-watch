@@ -35,6 +35,7 @@ behind its live remote and can notify you when a new remote commit appears.
 - GitHub, GitLab, self-hosted Git, and local `file://` remotes
 - Any branch name, including `main`, `master`, `develop`, and `release/*`
 - Automatic remote default-branch detection
+- Interactive discovery and selection of local and live remote branches
 - Multiple repositories and branches in one compact bar widget
 - Native folder picker for selecting local repositories
 - Desktop notifications for newly observed remote changes
@@ -87,8 +88,8 @@ omarchy restart shell
 3. Enter a display name and a short bar label.
 4. Select the local Git working tree with **Browse…**, or enter its path.
 5. Keep the remote as `origin`, or enter another configured remote or URL.
-6. Leave **Branches** empty to detect the remote default, or list branches
-   explicitly.
+6. Select **Discover branches** to choose from local and live remote branches,
+   or leave the selection empty to follow the remote default automatically.
 7. Keep notifications enabled if desired and select **Save**.
 
 Example for a repository whose real branches are `develop` and `master`:
@@ -166,6 +167,21 @@ develop=D, master=M, release/2.x=R
 ```
 
 The part after `=` is only the bar label.
+In the advanced field, literal `\`, `,`, and `=` characters inside a branch
+name or label are escaped with a preceding backslash. Branches selected from
+the discovery list are escaped automatically.
+
+### Discovering branches
+
+The repository editor can query the selected working tree and remote, then
+show up to 200 available branches. Each entry indicates whether it exists
+locally, remotely, or in both places, and marks the checked-out and default
+branches. Select up to 16 branches directly in the list. A search field appears
+for larger results.
+
+Discovery runs only when **Discover branches** is selected. It performs one
+bounded `git ls-remote` query and does not fetch or change the repository. The
+advanced `branch=label` field remains available for manual editing.
 
 ### Choosing the local path
 

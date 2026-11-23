@@ -2,7 +2,8 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-bash -n "$ROOT/bin/omarchy-branch-watch-check" "$ROOT/bin/branch-watch-probe"
+bash -n "$ROOT/bin/omarchy-branch-watch-check" "$ROOT/bin/branch-watch-probe" \
+  "$ROOT/bin/branch-watch-list-branches"
 /usr/bin/python3 "$ROOT/test/matrix-tests.py"
 /usr/bin/python3 "$ROOT/test/qml-smoke.py"
 omarchy plugin validate "$ROOT"

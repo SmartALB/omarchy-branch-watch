@@ -1,0 +1,117 @@
+#!/bin/bash
+# List local and live remote branches for the interactive repository picker.
+# This performs no fetch and never changes repository refs or objects.
+set -uo pipefail
+umask 077
+
+export GIT_TERMINAL_PROMPT=0 GIT_NO_LAZY_FETCH=1 GIT_OPTIONAL_LOCKS=0 GIT_NO_REPLACE_OBJECTS=1
+
+repo_path=""
+remote="origin"
+saw_json=false
+probe_timeout="${BRANCH_WATCH_TIMEOUT:-20}"
+[[ "$probe_timeout" =~ ^[1-9][0-9]?$ ]] && (( probe_timeout <= 30 )) || probe_timeout=20
+
+usage() {
+  echo 'Usage: branch-watch-list-branches --json --path <repository> [--remote <name-or-url>]' >&2
+  exit 1
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --json) saw_json=true; shift ;;
+    --path)
+      [ "$#" -ge 2 ] || usage
+      repo_path="$2"; shift 2 ;;
+    --remote)
+      [ "$#" -ge 2 ] || usage
+      remote="$2"; shift 2 ;;
+    *) usage ;;
+  esac
+done
+[ "$saw_json" = true ] && [ -n "$repo_path" ] || usage
+
+if ! command -v jq >/dev/null; then
+  printf '%s\n' '{"schemaVersion":1,"branches":[],"error":"Missing required program: jq"}'
+  exit 0
+fi
+for tool in git timeout; do
+  command -v "$tool" >/dev/null || {
+    jq -nc --arg error "Missing required program: $tool" \
+      '{schemaVersion:1,branches:[],error:$error}'
+    exit 0
+  }
+done
+
+case "$repo_path" in
+  '~') repo_path="$HOME" ;;
+  '~/'*) repo_path="$HOME/${repo_path#\~/}" ;;
+esac
+
+fail() {
+  jq -nc --arg error "$1" '{schemaVersion:1,branches:[],error:$error}'
+  exit 0
+}
+
+git_read() {
+  timeout -k 2 "$probe_timeout" git \
+    -c protocol.allow=never \
+    -c protocol.file.allow=always \
+    -c protocol.ssh.allow=always \
+    -c protocol.http.allow=always \
+    -c protocol.https.allow=always \
+    -c protocol.git.allow=always \
+    -c protocol.ext.allow=never \
+    "$@"
+}
+
+[ -e "$repo_path/.git" ] || fail "Repository not found"
+[ "$(git_read -C "$repo_path" rev-parse --is-inside-work-tree 2>/dev/null)" = true ] \
+  || fail "Repository not found"
+
+checkout="$(git_read -C "$repo_path" symbolic-ref --quiet --short HEAD 2>/dev/null)" || checkout=""
+local_json="$(git_read -C "$repo_path" for-each-ref \
+  --format='%(refname:strip=2)' refs/heads/ 2>/dev/null \
+  | jq -Rsc 'split("\n") | map(select(length>0)) | unique')" \
+  || fail "Local branches could not be read"
+
+ssh_command="${GIT_SSH_COMMAND:-}"
+if [ -z "$ssh_command" ]; then
+  ssh_command="$(git_read -C "$repo_path" config --get core.sshCommand 2>/dev/null)" || ssh_command=""
+fi
+ssh_command="${ssh_command:-ssh} -o BatchMode=yes -o ConnectTimeout=10"
+
+runtime_tmp="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
+remote_output="$(mktemp "$runtime_tmp/branch-watch-branches.XXXXXX")" \
+  || fail "Temporary branch data could not be created"
+trap 'rm -f "$remote_output"' EXIT
+
+GIT_SSH_COMMAND="$ssh_command" git_read -C "$repo_path" ls-remote --symref -- \
+  "${remote:-origin}" HEAD 'refs/heads/*' 2>/dev/null \
+  | head -c 262145 >"$remote_output"
+remote_status="${PIPESTATUS[0]}"
+[ "$(stat -c %s "$remote_output" 2>/dev/null || echo 9999999)" -le 262144 ] \
+  || fail "Remote branch list exceeds 256 KiB"
+[ "$remote_status" -eq 0 ] || fail "Remote is unreachable; check network and authentication"
+
+default_branch="$(awk '$1=="ref:" && $3=="HEAD" {
+  sub("refs/heads/", "", $2); print $2; exit
+}' "$remote_output")"
+remote_json="$(awk '$2 ~ /^refs\/heads\// {
+  sub("refs/heads/", "", $2); print $2
+}' "$remote_output" | jq -Rsc 'split("\n") | map(select(length>0)) | unique')"
+
+jq -nc \
+  --argjson local "$local_json" \
+  --argjson remote "$remote_json" \
+  --arg checkout "$checkout" \
+  --arg defaultBranch "$default_branch" '
+  [($local + $remote | unique[]) as $name
+    | {name:$name,
+       local:($local | index($name) != null),
+       remote:($remote | index($name) != null),
+       checkedOut:($name==$checkout),
+       default:($name==$defaultBranch)}]
+  | sort_by((.default|not), (.checkedOut|not), .name)
+  | {schemaVersion:1,branches:.[0:200],truncated:(length>200),
+     checkout:$checkout,defaultBranch:$defaultBranch,error:""}'
