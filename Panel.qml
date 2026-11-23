@@ -28,11 +28,34 @@ Panel {
   property bool receivedResult: false
   property bool refreshPending: false
   property bool folderDialogActive: false
+  property bool editorDirty: false
+  property bool closeConfirmation: false
   property int configRevision: 0
   property int activeProbeRevision: -1
   property int rowsRevision: 0
 
   onRowsRevisionChanged: Qt.callLater(function() { content.forceLayout() })
+
+  // Protect in-progress repository edits from outside-click dismissal. The
+  // folder picker bypasses this guard while the form stays loaded off-screen.
+  function close() {
+    if (root.editorDirty && !root.folderDialogActive) {
+      root.closeConfirmation = true
+      return
+    }
+    root.controller.hide()
+  }
+
+  function toggle() {
+    if (root.opened) root.close()
+    else root.open()
+  }
+
+  function discardEditorAndClose() {
+    root.editorDirty = false
+    root.closeConfirmation = false
+    root.controller.hide()
+  }
 
   function defaultConfig() {
     return { schemaVersion: 1, intervalMinutes: 10, notifications: true, repositories: [] }
@@ -186,6 +209,35 @@ Panel {
       byId[groupKey].branches.push(row)
     }
     return list
+  }
+
+  function repositorySummary(repository, repositoryIndex) {
+    var revision = root.rowsRevision
+    var id = String(repository.id || "")
+    var counts = ({current: 0, behind: 0, ahead: 0, diverged: 0,
+      different: 0, missing: 0, error: 0})
+    var total = 0
+    for (var i = 0; i < root.rows.length; i++) {
+      var row = root.rows[i]
+      var rowKey = String(row.repoKey || "")
+      if (rowKey) {
+        if (rowKey.indexOf(String(repositoryIndex) + ":") !== 0) continue
+        if (rowKey.slice(rowKey.indexOf(":") + 1) !== id) continue
+      } else if (String(row.repoId || "") !== id) continue
+      var state = String(row.state || "error")
+      if (counts[state] === undefined) counts[state] = 0
+      counts[state]++
+      total++
+    }
+    if (total === 0) return "Not checked yet"
+    var parts = []
+    if (counts.current) parts.push(counts.current + " current")
+    if (counts.behind) parts.push(counts.behind + " behind")
+    var different = counts.ahead + counts.diverged + counts.different
+    if (different) parts.push(different + " different")
+    if (counts.missing) parts.push(counts.missing + " missing")
+    if (counts.error) parts.push(counts.error + " error")
+    return parts.join(" · ") + (root.lastCheck ? " · " + root.lastCheck : "")
   }
 
   FileView {
@@ -417,9 +469,18 @@ Panel {
           active: root.opened || root.folderDialogActive
           width: parent.width
           sourceComponent: Component {
-            Flickable {
+            Item {
+              id: settingsBody
+              readonly property real footerSpace: editorActions.visible
+                ? editorActions.implicitHeight + Style.space(8) : 0
+              implicitHeight: Math.min(form.implicitHeight + footerSpace, Style.space(620))
+
+              Flickable {
           id: scroller
-          implicitHeight: Math.min(form.implicitHeight, Style.space(620))
+          anchors.top: parent.top
+          anchors.left: parent.left
+          anchors.right: parent.right
+          height: Math.max(0, parent.height - settingsBody.footerSpace)
           contentWidth: width
           contentHeight: form.implicitHeight
           clip: true
@@ -431,6 +492,11 @@ Panel {
             property int editIndex: -2
             property string editId: ""
             property bool confirmRemove: false
+            property bool confirmCancel: false
+            property int editSession: 0
+            property string editBaseline: ""
+            property var branchLabelDrafts: ({})
+            property int branchDraftRevision: 0
             property var discoveredBranches: []
             property bool branchDiscoveryLoading: false
             property bool branchDiscoveryReceived: false
@@ -438,30 +504,58 @@ Panel {
             property bool branchListExpanded: false
             property string branchDiscoveryError: ""
             property string activeDiscoveryKey: ""
+            property int activeDiscoverySession: -1
+            property string validationState: "unknown"
+            property string validationMessage: "Repository not validated yet."
+            property string detectedDefaultBranch: ""
 
             function startAdd() {
+              if (root.editorDirty) {
+                root.closeConfirmation = true
+                return
+              }
               editIndex = -1
+              editSession++
+              editBaseline = ""
+              editorError.text = ""
               editId = ""
               confirmRemove = false
+              confirmCancel = false
               nameField.text = ""
               labelField.text = ""
               pathField.text = ""
               remoteField.text = "origin"
               branchesField.text = ""
+              resetBranchLabelDrafts([])
               discoveredBranches = []
               branchDiscoveryTruncated = false
               branchListExpanded = false
               branchDiscoveryError = ""
               branchFilter.text = ""
+              validationState = "unknown"
+              validationMessage = "Repository not validated yet."
+              detectedDefaultBranch = ""
               repoNotifications.checked = true
+              root.editorDirty = false
+              root.closeConfirmation = false
+              if (branchDiscoveryProc.running) branchDiscoveryProc.running = false
+              branchDiscoveryLoading = false
               nameField.forceActiveFocus()
             }
 
             function startEdit(index) {
+              if (root.editorDirty) {
+                root.closeConfirmation = true
+                return
+              }
               var repo = root.config.repositories[index]
               editIndex = index
+              editSession++
               editId = String(repo.id || "")
+              editBaseline = JSON.stringify(repo)
+              editorError.text = ""
               confirmRemove = false
+              confirmCancel = false
               nameField.text = String(repo.name || "")
               labelField.text = String(repo.label || "")
               pathField.text = String(repo.path || "")
@@ -474,12 +568,37 @@ Panel {
                 parts.push({name: String(branch.name), label: String(branch.label || "")})
               }
               branchesField.text = formatBranches(parts)
+              resetBranchLabelDrafts(parts)
               discoveredBranches = []
               branchDiscoveryTruncated = false
               branchListExpanded = false
               branchDiscoveryError = ""
               branchFilter.text = ""
+              validationState = "unknown"
+              validationMessage = "Select Discover branches to validate the repository and remote."
+              detectedDefaultBranch = ""
               repoNotifications.checked = repo.notifications !== false
+              root.editorDirty = false
+              root.closeConfirmation = false
+              if (branchDiscoveryProc.running) branchDiscoveryProc.running = false
+              branchDiscoveryLoading = false
+            }
+
+            function markDirty() {
+              root.editorDirty = true
+              root.closeConfirmation = false
+              confirmCancel = false
+            }
+
+            function invalidateValidation() {
+              if (branchDiscoveryProc.running) branchDiscoveryProc.running = false
+              branchDiscoveryLoading = false
+              validationState = "unknown"
+              validationMessage = "Repository settings changed; validate again."
+              detectedDefaultBranch = ""
+              discoveredBranches = []
+              branchDiscoveryTruncated = false
+              branchListExpanded = false
             }
 
             function parsedBranches(text) {
@@ -529,6 +648,46 @@ Panel {
               return result
             }
 
+            function branchDraftKey(name) {
+              return "\u0001" + String(name || "")
+            }
+
+            function resetBranchLabelDrafts(branches) {
+              var drafts = ({})
+              for (var i = 0; i < branches.length; i++) {
+                var branch = typeof branches[i] === "string" ? {name: branches[i]} : branches[i]
+                if (!branch || !branch.name) continue
+                drafts[branchDraftKey(branch.name)] = String(branch.label
+                  || String(branch.name).slice(0, 1).toUpperCase())
+              }
+              branchLabelDrafts = drafts
+              branchDraftRevision++
+            }
+
+            function branchLabelDraft(name, fallback) {
+              var revision = branchDraftRevision
+              var value = branchLabelDrafts[branchDraftKey(name)]
+              return value === undefined ? String(fallback || "") : String(value)
+            }
+
+            function setBranchLabelDraft(name, label) {
+              branchLabelDrafts[branchDraftKey(name)] = String(label || "")
+              branchDraftRevision++
+              markDirty()
+            }
+
+            function selectedBranchesWithDraftLabels() {
+              var revision = branchDraftRevision
+              var selected = parsedBranches(branchesField.text)
+              for (var i = 0; i < selected.length; i++) {
+                var draft = branchLabelDrafts[branchDraftKey(selected[i].name)]
+                if (draft !== undefined)
+                  selected[i].label = String(draft || "").trim()
+                    || String(selected[i].name).slice(0, 1).toUpperCase()
+              }
+              return selected
+            }
+
             function expandedPath(path) {
               var value = String(path || "").trim()
               if (value === "~") return Quickshell.env("HOME")
@@ -562,12 +721,19 @@ Panel {
               return expandedPath(pathField.text) + "\u0000" + (remoteField.text.trim() || "origin")
             }
 
+            function discoveryRequestCurrent() {
+              return activeDiscoverySession === editSession
+                && activeDiscoveryKey === discoveryKey()
+            }
+
             function discoverBranches() {
               if (branchListExpanded) {
                 branchListExpanded = false
                 return
               }
-              if (discoveredBranches.length > 0 && activeDiscoveryKey === discoveryKey()) {
+              if (discoveredBranches.length > 0
+                  && activeDiscoverySession === editSession
+                  && activeDiscoveryKey === discoveryKey()) {
                 branchListExpanded = true
                 return
               }
@@ -582,6 +748,9 @@ Panel {
               branchListExpanded = false
               branchDiscoveryReceived = false
               branchDiscoveryLoading = true
+              validationState = "checking"
+              validationMessage = "Checking repository and remote…"
+              activeDiscoverySession = editSession
               activeDiscoveryKey = discoveryKey()
               branchDiscoveryProc.running = true
             }
@@ -594,23 +763,26 @@ Panel {
             }
 
             function selectedBranches() {
-              return parsedBranches(branchesField.text)
+              return selectedBranchesWithDraftLabels()
             }
 
             function removeBranch(name) {
-              var selected = parsedBranches(branchesField.text)
+              var selected = selectedBranchesWithDraftLabels()
               for (var i = 0; i < selected.length; i++) {
                 if (selected[i].name === name) {
                   selected.splice(i, 1)
                   branchesField.text = formatBranches(selected)
+                  delete branchLabelDrafts[branchDraftKey(name)]
+                  branchDraftRevision++
                   branchDiscoveryError = ""
+                  markDirty()
                   return
                 }
               }
             }
 
             function toggleBranch(name) {
-              var selected = parsedBranches(branchesField.text)
+              var selected = selectedBranchesWithDraftLabels()
               for (var i = 0; i < selected.length; i++) {
                 if (selected[i].name === name) {
                   removeBranch(name)
@@ -621,9 +793,26 @@ Panel {
                 branchDiscoveryError = "At most 16 branches can be monitored per repository."
                 return
               }
-              selected.push({name: name, label: name.slice(0, 1).toUpperCase()})
+              var defaultLabel = name.slice(0, 1).toUpperCase()
+              selected.push({name: name, label: defaultLabel})
+              branchLabelDrafts[branchDraftKey(name)] = defaultLabel
+              branchDraftRevision++
               branchesField.text = formatBranches(selected)
               branchDiscoveryError = ""
+              markDirty()
+            }
+
+            function duplicateBranchLabels() {
+              var selected = selectedBranchesWithDraftLabels()
+              var labels = ({})
+              var duplicates = []
+              for (var i = 0; i < selected.length; i++) {
+                var label = String(selected[i].label || "")
+                var key = "\u0001" + label
+                if (labels[key] && duplicates.indexOf(label) === -1) duplicates.push(label)
+                labels[key] = true
+              }
+              return duplicates
             }
 
             function formatBranches(branches) {
@@ -681,7 +870,7 @@ Panel {
                 editorError.text = "The limit of 24 repositories has been reached."
                 return
               }
-              var selectedBranches = parsedBranches(branchesField.text)
+              var selectedBranches = selectedBranchesWithDraftLabels()
               if (selectedBranches.length > 16) {
                 editorError.text = "At most 16 branches can be monitored per repository."
                 return
@@ -693,6 +882,10 @@ Panel {
                 return
               }
               var existing = targetIndex >= 0 ? next.repositories[targetIndex] : null
+              if (existing && JSON.stringify(existing) !== editBaseline) {
+                editorError.text = "This repository was changed elsewhere. Reopen it before saving."
+                return
+              }
               var record = {
                 id: existing && existing.id ? existing.id : "repo-" + Date.now(),
                 name: name,
@@ -708,10 +901,16 @@ Panel {
               editIndex = -2
               editId = ""
               confirmRemove = false
+              confirmCancel = false
+              root.editorDirty = false
+              root.closeConfirmation = false
             }
 
             function removeEdit() {
-              if (editIndex < 0) { editIndex = -2; return }
+              if (editIndex < 0) {
+                requestCancelEdit()
+                return
+              }
               if (!confirmRemove) {
                 confirmRemove = true
                 editorError.text = "Select “Confirm remove” to remove this repository."
@@ -724,11 +923,36 @@ Panel {
                 confirmRemove = false
                 return
               }
+              if (JSON.stringify(next.repositories[targetIndex]) !== editBaseline) {
+                editorError.text = "This repository was changed elsewhere. Reopen it before removing."
+                confirmRemove = false
+                return
+              }
               next.repositories.splice(targetIndex, 1)
               root.saveConfig(next)
               editIndex = -2
               editId = ""
               confirmRemove = false
+              confirmCancel = false
+              root.editorDirty = false
+              root.closeConfirmation = false
+            }
+
+            function requestCancelEdit() {
+              if (root.editorDirty) {
+                confirmCancel = true
+                return
+              }
+              discardEdit()
+            }
+
+            function discardEdit() {
+              root.editorDirty = false
+              root.closeConfirmation = false
+              confirmCancel = false
+              confirmRemove = false
+              editIndex = -2
+              editId = ""
             }
 
             PanelSectionHeader {
@@ -784,8 +1008,9 @@ Panel {
                 required property var modelData
                 required property int index
                 width: form.width
-                height: Style.space(46)
+                height: Style.space(58)
                 text: String(modelData.name || "Repository") + "  ·  " + String(modelData.remote || "origin")
+                  + "\n" + root.repositorySummary(modelData, index)
                 foreground: root.fg
                 accent: Color.accent
                 fontFamily: root.fontFam
@@ -826,9 +1051,9 @@ Panel {
 
               Text { text: form.editIndex < 0 ? "Add repository" : "Edit repository"; textFormat: Text.PlainText; color: root.fg; font.family: root.fontFam; font.pixelSize: Style.font.subtitle; font.bold: true }
               Text { text: "Name"; textFormat: Text.PlainText; color: root.fg; font.family: root.fontFam; font.pixelSize: Style.font.caption }
-              TextField { id: nameField; width: parent.width; placeholderText: "Backend"; foreground: root.fg; accent: Color.accent; font.family: root.fontFam }
+              TextField { id: nameField; width: parent.width; placeholderText: "Backend"; foreground: root.fg; accent: Color.accent; font.family: root.fontFam; onTextEdited: form.markDirty() }
               Text { text: "Short bar label"; textFormat: Text.PlainText; color: root.fg; font.family: root.fontFam; font.pixelSize: Style.font.caption }
-              TextField { id: labelField; width: parent.width; placeholderText: "API"; foreground: root.fg; accent: Color.accent; font.family: root.fontFam }
+              TextField { id: labelField; width: parent.width; placeholderText: "API"; foreground: root.fg; accent: Color.accent; font.family: root.fontFam; onTextEdited: form.markDirty() }
               Text { text: "Local repository path"; textFormat: Text.PlainText; color: root.fg; font.family: root.fontFam; font.pixelSize: Style.font.caption }
               RowLayout {
                 width: parent.width
@@ -840,6 +1065,10 @@ Panel {
                   foreground: root.fg
                   accent: Color.accent
                   font.family: root.fontFam
+                  onTextEdited: {
+                    form.markDirty()
+                    form.invalidateValidation()
+                  }
                 }
                 Button {
                   text: "Browse…"
@@ -858,7 +1087,11 @@ Panel {
                 options: FolderDialog.ReadOnly
                 onAccepted: {
                   var selected = form.selectedLocalPath(selectedFolder)
-                  if (selected) pathField.text = selected
+                  if (selected) {
+                    pathField.text = selected
+                    form.markDirty()
+                    form.invalidateValidation()
+                  }
                   form.returnFromFolderDialog()
                 }
                 onRejected: form.returnFromFolderDialog()
@@ -874,11 +1107,8 @@ Panel {
                 stdout: StdioCollector {
                   waitForEnd: true
                   onStreamFinished: {
+                    if (!form.discoveryRequestCurrent()) return
                     form.branchDiscoveryReceived = true
-                    if (form.activeDiscoveryKey !== form.discoveryKey()) {
-                      form.branchDiscoveryError = "Repository settings changed; discover branches again."
-                      return
-                    }
                     try {
                       var data = JSON.parse(String(text || ""))
                       if (data.schemaVersion !== 1 || !Array.isArray(data.branches))
@@ -886,15 +1116,25 @@ Panel {
                       form.discoveredBranches = data.branches
                       form.branchDiscoveryTruncated = data.truncated === true
                       form.branchDiscoveryError = String(data.error || "")
-                      form.branchListExpanded = !form.branchDiscoveryError && data.branches.length > 0
                       if (!form.branchDiscoveryError && data.branches.length === 0)
                         form.branchDiscoveryError = "No local or remote branches were found."
+                      form.detectedDefaultBranch = String(data.defaultBranch || "")
+                      form.validationState = form.branchDiscoveryError ? "error" : "valid"
+                      form.validationMessage = form.branchDiscoveryError
+                        ? form.branchDiscoveryError
+                        : "Repository and remote validated"
+                          + (form.detectedDefaultBranch
+                            ? " · Default: " + form.detectedDefaultBranch : "")
+                      form.branchListExpanded = !form.branchDiscoveryError && data.branches.length > 0
                     } catch (error) {
                       form.branchDiscoveryError = "No valid response from the branch discovery helper."
+                      form.validationState = "error"
+                      form.validationMessage = form.branchDiscoveryError
                     }
                   }
                 }
                 onExited: function(exitCode, exitStatus) {
+                  if (!form.discoveryRequestCurrent()) return
                   form.branchDiscoveryLoading = false
                   if (exitCode !== 0 && !form.branchDiscoveryError)
                     form.branchDiscoveryError = (exitCode === 124 || exitCode === 137)
@@ -902,10 +1142,39 @@ Panel {
                       : "Branch discovery helper exited with error " + exitCode + "."
                   else if (!form.branchDiscoveryReceived && !form.branchDiscoveryError)
                     form.branchDiscoveryError = "Branch discovery helper returned no result."
+                  if (form.branchDiscoveryError) {
+                    form.validationState = "error"
+                    form.validationMessage = form.branchDiscoveryError
+                  }
                 }
               }
               Text { text: "Git remote name or URL"; textFormat: Text.PlainText; color: root.fg; font.family: root.fontFam; font.pixelSize: Style.font.caption }
-              TextField { id: remoteField; width: parent.width; placeholderText: "origin"; foreground: root.fg; accent: Color.accent; font.family: root.fontFam }
+              TextField {
+                id: remoteField
+                width: parent.width
+                placeholderText: "origin"
+                foreground: root.fg
+                accent: Color.accent
+                font.family: root.fontFam
+                onTextEdited: {
+                  form.markDirty()
+                  form.invalidateValidation()
+                }
+              }
+              Text {
+                width: parent.width
+                text: (form.validationState === "valid" ? "✓  "
+                  : form.validationState === "error" ? "⚠  "
+                  : form.validationState === "checking" ? "…  " : "○  ")
+                  + form.validationMessage
+                textFormat: Text.PlainText
+                wrapMode: Text.WordWrap
+                color: form.validationState === "valid" ? "#78c88a"
+                  : form.validationState === "error" ? "#ef7777"
+                  : Util.alpha(root.fg, 0.7)
+                font.family: root.fontFam
+                font.pixelSize: Style.font.caption
+              }
               Text {
                 text: "Branches — leave the selection empty to follow the remote default branch automatically."
                 textFormat: Text.PlainText
@@ -925,22 +1194,58 @@ Panel {
                 font.pixelSize: Style.font.caption
               }
               Repeater {
-                model: form.selectedBranches()
-                Button {
+                // Keep delegates stable while a label is typed. The draft
+                // revision updates each TextField binding and warnings, but
+                // must not rebuild the row and steal keyboard focus.
+                model: form.parsedBranches(branchesField.text)
+                RowLayout {
                   required property var modelData
                   width: form.width
-                  text: "×  " + String(modelData.name || "")
-                    + "  ·  Label: " + String(modelData.label || "")
-                  tooltipText: "Remove " + String(modelData.name || "") + " from tracked branches"
-                  foreground: root.fg
-                  accent: Color.accent
-                  fontFamily: root.fontFam
-                  leftAlign: true
-                  bordered: true
-                  focusable: true
-                  selected: true
-                  onClicked: form.removeBranch(String(modelData.name || ""))
+                  spacing: Style.space(6)
+                  Text {
+                    Layout.fillWidth: true
+                    text: String(parent.modelData.name || "")
+                    textFormat: Text.PlainText
+                    elide: Text.ElideMiddle
+                    color: root.fg
+                    font.family: root.fontFam
+                    font.pixelSize: Style.font.body
+                  }
+                  TextField {
+                    Layout.preferredWidth: Style.space(68)
+                    text: form.branchLabelDraft(
+                      String(parent.modelData.name || ""), String(parent.modelData.label || ""))
+                    placeholderText: "Label"
+                    foreground: root.fg
+                    accent: Color.accent
+                    font.family: root.fontFam
+                    maximumLength: 12
+                    onTextEdited: form.setBranchLabelDraft(
+                      String(parent.modelData.name || ""), text)
+                    onEditingFinished: branchesField.text = form.formatBranches(
+                      form.selectedBranchesWithDraftLabels())
+                  }
+                  Button {
+                    text: "Remove"
+                    tooltipText: "Remove " + String(parent.modelData.name || "") + " from tracked branches"
+                    foreground: root.fg
+                    accent: Color.accent
+                    fontFamily: root.fontFam
+                    bordered: true
+                    focusable: true
+                    onClicked: form.removeBranch(String(parent.modelData.name || ""))
+                  }
                 }
+              }
+              Text {
+                visible: form.duplicateBranchLabels().length > 0
+                width: parent.width
+                text: "Duplicate bar labels: " + form.duplicateBranchLabels().join(", ")
+                textFormat: Text.PlainText
+                wrapMode: Text.WordWrap
+                color: "#e5c76b"
+                font.family: root.fontFam
+                font.pixelSize: Style.font.caption
               }
               RowLayout {
                 width: parent.width
@@ -972,6 +1277,7 @@ Panel {
                     branchesField.text = ""
                     form.branchListExpanded = false
                     form.branchDiscoveryError = ""
+                    form.markDirty()
                   }
                 }
               }
@@ -984,11 +1290,32 @@ Panel {
                 accent: Color.accent
                 font.family: root.fontFam
               }
-              Repeater {
+              Text {
+                visible: form.branchListExpanded
+                width: parent.width
+                text: form.selectedBranches().length + " selected · "
+                  + form.filteredDiscoveredBranches().length + " shown · "
+                  + form.discoveredBranches.length + " discovered"
+                textFormat: Text.PlainText
+                color: Util.alpha(root.fg, 0.7)
+                font.family: root.fontFam
+                font.pixelSize: Style.font.caption
+              }
+              ListView {
+                id: discoveredBranchList
+                visible: form.branchListExpanded
+                width: parent.width
+                height: visible
+                  ? Math.min(count, 8) * Style.space(40) + Math.max(0, Math.min(count, 8) - 1) * spacing
+                  : 0
+                clip: true
+                spacing: Style.space(4)
+                boundsBehavior: Flickable.StopAtBounds
                 model: form.branchListExpanded ? form.filteredDiscoveredBranches() : []
-                Button {
+                delegate: Button {
                   required property var modelData
-                  width: form.width
+                  width: discoveredBranchList.width
+                  height: Style.space(40)
                   text: form.branchDescription(modelData)
                   foreground: root.fg
                   accent: Color.accent
@@ -1028,32 +1355,40 @@ Panel {
                 font.family: root.fontFam
                 font.pixelSize: Style.font.caption
               }
-              TextField { id: branchesField; width: parent.width; placeholderText: "develop=D, master=M"; foreground: root.fg; accent: Color.accent; font.family: root.fontFam }
-              Toggle { id: repoNotifications; width: parent.width; label: "Notifications for this repository"; foreground: root.fg; accent: Color.accent; fontFamily: root.fontFam; checked: true }
-              Text { id: editorError; width: parent.width; textFormat: Text.PlainText; wrapMode: Text.WordWrap; color: "#ef7777"; font.family: root.fontFam; font.pixelSize: Style.font.caption }
-
-              Row {
-                spacing: Style.space(8)
-                Repeater {
-                  model: ["Save", form.editIndex >= 0 ? (form.confirmRemove ? "Confirm remove" : "Remove") : "Cancel"]
-                  Button {
-                    required property string modelData
-                    required property int index
-                    width: Style.space(100)
-                    height: Style.space(38)
-                    text: modelData
-                    foreground: root.fg
-                    accent: Color.accent
-                    fontFamily: root.fontFam
-                    bordered: true
-                    focusable: true
-                    onClicked: {
-                      editorError.text = ""
-                      if (index === 0) form.commitEdit()
-                      else form.removeEdit()
-                    }
-                  }
+              TextField {
+                id: branchesField
+                width: parent.width
+                placeholderText: "develop=D, master=M"
+                foreground: root.fg
+                accent: Color.accent
+                font.family: root.fontFam
+                onTextEdited: {
+                  form.resetBranchLabelDrafts(form.parsedBranches(text))
+                  form.markDirty()
                 }
+              }
+              Toggle { id: repoNotifications; width: parent.width; label: "Notifications for this repository"; foreground: root.fg; accent: Color.accent; fontFamily: root.fontFam; checked: true; onClicked: form.markDirty() }
+              Text { id: editorError; width: parent.width; textFormat: Text.PlainText; wrapMode: Text.WordWrap; color: "#ef7777"; font.family: root.fontFam; font.pixelSize: Style.font.caption }
+              Text {
+                visible: root.editorDirty
+                width: parent.width
+                text: "Unsaved changes"
+                textFormat: Text.PlainText
+                color: "#e5c76b"
+                font.family: root.fontFam
+                font.pixelSize: Style.font.caption
+              }
+              Text {
+                visible: root.closeConfirmation || form.confirmCancel
+                width: parent.width
+                text: root.closeConfirmation
+                  ? "Discard the unsaved repository changes and close the panel?"
+                  : "Discard the unsaved repository changes?"
+                textFormat: Text.PlainText
+                wrapMode: Text.WordWrap
+                color: "#ef7777"
+                font.family: root.fontFam
+                font.pixelSize: Style.font.caption
               }
             }
 
@@ -1067,6 +1402,82 @@ Panel {
               font.pixelSize: Style.font.caption
             }
           }
+              Row {
+                id: editorActions
+                visible: form.editIndex >= -1
+                anchors.left: parent.left
+                anchors.bottom: parent.bottom
+                spacing: Style.space(8)
+
+                Button {
+                  visible: root.closeConfirmation || form.confirmCancel
+                  text: "Keep editing"
+                  foreground: root.fg
+                  accent: Color.accent
+                  fontFamily: root.fontFam
+                  bordered: true
+                  focusable: true
+                  onClicked: {
+                    root.closeConfirmation = false
+                    form.confirmCancel = false
+                  }
+                }
+                Button {
+                  visible: root.closeConfirmation || form.confirmCancel
+                  text: root.closeConfirmation ? "Discard and close" : "Discard changes"
+                  foreground: root.fg
+                  accent: Color.accent
+                  fontFamily: root.fontFam
+                  bordered: true
+                  focusable: true
+                  onClicked: {
+                    if (root.closeConfirmation) root.discardEditorAndClose()
+                    else form.discardEdit()
+                  }
+                }
+                Button {
+                  visible: !root.closeConfirmation && !form.confirmCancel
+                  text: root.editorDirty ? "Save changes" : "Save"
+                  foreground: root.fg
+                  accent: Color.accent
+                  fontFamily: root.fontFam
+                  bordered: true
+                  focusable: true
+                  enabled: form.validationState !== "error"
+                  onClicked: {
+                    editorError.text = ""
+                    form.commitEdit()
+                  }
+                }
+                Button {
+                  visible: !root.closeConfirmation && !form.confirmCancel
+                  text: "Cancel"
+                  foreground: root.fg
+                  accent: Color.accent
+                  fontFamily: root.fontFam
+                  bordered: true
+                  focusable: true
+                  onClicked: {
+                    editorError.text = ""
+                    form.requestCancelEdit()
+                  }
+                }
+                Button {
+                  visible: !root.closeConfirmation && !form.confirmCancel
+                    && form.editIndex >= 0
+                  text: form.confirmRemove ? "Confirm remove" : "Remove"
+                  foreground: root.fg
+                  accent: Color.accent
+                  fontFamily: root.fontFam
+                  bordered: true
+                  focusable: true
+                  onClicked: {
+                    editorError.text = ""
+                    form.removeEdit()
+                  }
+                }
+              }
+            }
             }
           }
         }

@@ -36,6 +36,8 @@ behind its live remote and can notify you when a new remote commit appears.
 - Any branch name, including `main`, `master`, `develop`, and `release/*`
 - Automatic remote default-branch detection
 - Interactive discovery and selection of local and live remote branches
+- Editable short labels and one-click removal for tracked branches
+- Repository validation, unsaved-change protection, and compact status summaries
 - Multiple repositories and branches in one compact bar widget
 - Native folder picker for selecting local repositories
 - Desktop notifications for newly observed remote changes
@@ -176,12 +178,19 @@ the discovery list are escaped automatically.
 The repository editor can query the selected working tree and remote, then
 show up to 200 available branches. Each entry indicates whether it exists
 locally, remotely, or in both places, and marks the checked-out and default
-branches. Select up to 16 branches directly in the list. A search field appears
-for larger results.
+branches. Select up to 16 branches directly in the compact scrolling list. A
+search field appears for larger results. Selected branches remain visible above
+the discovery controls, where their short labels can be edited or the branch
+can be removed without changing the advanced field manually.
 
 Discovery runs only when **Discover branches** is selected. It performs one
 bounded `git ls-remote` query and does not fetch or change the repository. The
 advanced `branch=label` field remains available for manual editing.
+
+A successful discovery also validates the local working tree and remote and
+shows the detected default branch. Repository cards summarize their latest
+current, behind, different, missing, and error counts. Unsaved editor changes
+must be explicitly discarded before the panel closes.
 
 ### Choosing the local path
 

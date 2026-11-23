@@ -44,8 +44,11 @@ ShellRoot {
     property bool foregroundAnimationEnabled: true
     property string fontFamily: "sans"
     property string position: "top"
-    property string activePopout: ""
+    property var activePopout: null
     function hideTooltip(target) {}
+    function requestPopout(key) { activePopout = key }
+    function releasePopout(key) { if (activePopout === key) activePopout = null }
+    function notePopoutCard(card) {}
   }
   QtObject {
     id: verticalBar
@@ -56,16 +59,25 @@ ShellRoot {
     property bool foregroundAnimationEnabled: true
     property string fontFamily: "sans"
     property string position: "left"
-    property string activePopout: ""
+    property var activePopout: null
     function hideTooltip(target) {}
+    function requestPopout(key) { activePopout = key }
+    function releasePopout(key) { if (activePopout === key) activePopout = null }
+    function notePopoutCard(card) {}
   }
   Plugin.Panel { id: horizontal; bar: horizontalBar; manageIpc: false }
   Plugin.Panel { id: vertical; bar: verticalBar; manageIpc: false }
   Timer {
     interval: 100; running: true; repeat: true
     property int settled: 0
+    property bool panelOpened: false
     onTriggered: {
       if (horizontal.rows.length !== 1 || vertical.rows.length !== 1) return
+      if (!panelOpened) {
+        horizontal.open()
+        panelOpened = true
+        return
+      }
       if (horizontal.rows[0].branch !== "master" || horizontal.rows[0].state !== "error") {
         console.log("BRANCH_WATCH_QML_FAIL dynamic row"); Qt.quit(); return
       }
@@ -84,6 +96,9 @@ ShellRoot {
       }
       if (horizontal.tooltip(horizontal.rows[0]).indexOf("Missing Repo · master") !== 0) {
         console.log("BRANCH_WATCH_QML_FAIL tooltip"); Qt.quit(); return
+      }
+      if (horizontal.repositorySummary({id: "missing"}, 0).indexOf("1 error") !== 0) {
+        console.log("BRANCH_WATCH_QML_FAIL repository summary"); Qt.quit(); return
       }
       var normalized = horizontal.normalizeConfig({repositories: [null, "bad", {name: "Valid", branches: "master"}]})
       if (normalized.repositories.length !== 1 || normalized.repositories[0].branches.length !== 0) {
